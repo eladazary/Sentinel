@@ -1,0 +1,16 @@
+# Sentinel watchlist — the hand-picked universe of 4–10 large-cap tickers.
+# Edit this file (or point SENTINEL_WATCHLIST_PATH elsewhere) to change the
+# universe. The spec caps this at 10 names; the loader enforces 1–10.
+tickers:
+  - symbol: NVDA
+    name: NVIDIA
+  - symbol: MSFT
+    name: Microsoft
+  - symbol: AAPL
+    name: Apple
+  - symbol: AMZN
+    name: Amazon
+  - symbol: JPM
+    name: JPMorgan Chase
+  - symbol: XOM
+    name: Exxon Mobil
