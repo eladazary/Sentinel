@@ -114,6 +114,23 @@ def backtest_command() -> None:
     print(json.dumps({"walk_forward_auc": auc, **summary}, indent=2))
 
 
+def simulate_dryrun_command() -> None:
+    parser = argparse.ArgumentParser(
+        description="Replay the last N months through the loop into the live tables"
+    )
+    parser.add_argument("--months", type=int, default=3)
+    args = parser.parse_args()
+
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    watchlist = settings.load_watchlist()
+    from sentinel.golive.simulate import simulate_dryrun
+
+    with session_scope() as session:
+        summary = simulate_dryrun(session, watchlist, settings, months=args.months)
+    print(json.dumps(summary, indent=2))
+
+
 def cycle_command() -> None:
     parser = argparse.ArgumentParser(description="Run one trading cycle now")
     parser.add_argument("--risk", type=int, default=None)

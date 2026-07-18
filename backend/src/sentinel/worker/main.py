@@ -89,7 +89,7 @@ def run() -> None:
     except Exception:  # noqa: BLE001 - never crash the loop on a backfill error
         log.exception("backfill failed; continuing")
 
-    model = _load_model(settings)
+    model = _ensure_model(settings)  # loads, or auto-trains if data exists
     broker = make_broker(settings)
     notifier = make_notifier(settings)
 
@@ -153,10 +153,35 @@ def _load_model(settings) -> TechnicalModel | None:
         log.info("loaded technical model (trained through %s)", model.trained_through)
         return model
     except Exception:  # noqa: BLE001 - model is optional until trained
-        log.warning(
-            "no technical model in %s — signals disabled until `sentinel-train` runs",
-            settings.model_dir,
+        return None
+
+
+def _ensure_model(settings) -> TechnicalModel | None:
+    """Load the model, or auto-train one if bars exist but no model is saved,
+    so a fresh `docker compose up` needs no manual training step."""
+    model = _load_model(settings)
+    if model is not None:
+        return model
+    log.info("no saved model — attempting auto-train from stored bars")
+    try:
+        from sentinel.features.dataset import build_training_frame
+        from sentinel.features.engineering import FEATURE_COLUMNS
+
+        watchlist = settings.load_watchlist()
+        with session_scope() as session:
+            frame = build_training_frame(session, watchlist, settings)
+        if frame.empty:
+            log.warning("no training data yet — signals disabled until data + train")
+            return None
+        trained_through = str(frame.index.max().date())
+        model = TechnicalModel.train(
+            frame[FEATURE_COLUMNS], frame["label"], trained_through=trained_through
         )
+        model.save(settings.model_dir)
+        log.info("auto-trained model on %d rows through %s", len(frame), trained_through)
+        return model
+    except Exception:  # noqa: BLE001 - never block startup on training
+        log.exception("auto-train failed; signals disabled")
         return None
 
 

@@ -40,6 +40,7 @@ sentinel-backfill = "sentinel.cli:backfill_command"
 sentinel-train = "sentinel.cli:train_command"
 sentinel-backtest = "sentinel.cli:backtest_command"
 sentinel-cycle = "sentinel.cli:cycle_command"
+sentinel-simulate-dryrun = "sentinel.cli:simulate_dryrun_command"
 
 [build-system]
 requires = ["setuptools>=68"]
