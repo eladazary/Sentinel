@@ -30,9 +30,87 @@ class WatchlistTicker(BaseModel):
     as_of: datetime | None
     stale: bool
     spark: list[float]
+    # Signal-engine overlay (null until the model has run).
+    conviction: float | None = None
+    confidence: float | None = None
+    technical_score: float | None = None
+    signal: str | None = None
+    drivers: list[str] = []
 
 
 class WatchlistResponse(BaseModel):
     mode: str
     count: int
     tickers: list[WatchlistTicker]
+
+
+class RiskProfileOut(BaseModel):
+    risk_factor: int
+    max_position_pct: float
+    max_exposure_pct: float
+    min_conviction: float
+    stop_atr_mult: float
+    max_new_positions_per_day: int
+    trade_around_earnings: str
+
+
+class RiskProfilesResponse(BaseModel):
+    default_risk_factor: int
+    profiles: list[RiskProfileOut]
+
+
+class SignalOut(BaseModel):
+    symbol: str
+    ts: datetime
+    conviction: float
+    confidence: float
+    technical_score: float | None
+    signal: str
+    drivers: list[str]
+    model_version: str | None
+
+
+class DecisionOut(BaseModel):
+    id: int
+    ts: datetime
+    symbol: str
+    action: str
+    signal: str
+    conviction: float
+    confidence: float
+    risk_factor: int
+    mode: str
+    reason: str
+    drivers: list[str]
+    broker_order_id: str | None
+
+
+class PositionOut(BaseModel):
+    symbol: str
+    qty: int
+    avg_entry: float
+    market_value: float
+
+
+class AccountResponse(BaseModel):
+    available: bool
+    mode: str
+    equity: float | None = None
+    cash: float | None = None
+    buying_power: float | None = None
+    exposure_pct: float | None = None
+    positions: list[PositionOut] = []
+    detail: str | None = None
+
+
+class BacktestOut(BaseModel):
+    id: int
+    created_at: datetime
+    risk_factor: int
+    start_date: str | None
+    end_date: str | None
+    n_trades: int
+    wf_auc: float | None
+    metrics: dict
+    benchmarks: dict
+    config: dict

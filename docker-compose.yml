@@ -49,6 +49,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      - model_artifacts:/app/artifacts
     ports:
       - "8000:8000"
     healthcheck:
@@ -76,6 +78,8 @@ services:
       # Wait for the API so migrations have run before the worker touches tables.
       api:
         condition: service_healthy
+    volumes:
+      - model_artifacts:/app/artifacts
 
   frontend:
     build: ./frontend
@@ -86,3 +90,4 @@ services:
 
 volumes:
   timescale_data:
+  model_artifacts:

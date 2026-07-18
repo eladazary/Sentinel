@@ -45,16 +45,16 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def backfill_prices(
+def backfill_symbols(
     md: MarketData,
-    watchlist: Watchlist,
+    symbols: list[str],
     years: int = 5,
     *,
     now: datetime | None = None,
     session_factory: SessionFactory = session_scope,
     force: bool = False,
 ) -> dict[str, int]:
-    """Backfill daily bars for every watchlist symbol.
+    """Backfill daily bars for an explicit list of symbols.
 
     Skips symbols that already have data unless ``force`` is set. Returns a
     mapping of symbol → number of bars written.
@@ -62,7 +62,7 @@ def backfill_prices(
     start, end = backfill_window(now or _utcnow(), years)
     results: dict[str, int] = {}
 
-    for symbol in watchlist.symbols:
+    for symbol in symbols:
         with session_factory() as session:
             existing = repo.count_daily_bars(session, symbol)
             if existing and not force:
@@ -83,6 +83,26 @@ def backfill_prices(
     total = sum(results.values())
     log.info("backfill complete: %d bars across %d symbols", total, len(results))
     return results
+
+
+def backfill_prices(
+    md: MarketData,
+    watchlist: Watchlist,
+    years: int = 5,
+    *,
+    now: datetime | None = None,
+    session_factory: SessionFactory = session_scope,
+    force: bool = False,
+) -> dict[str, int]:
+    """Backfill daily bars for every watchlist symbol (convenience wrapper)."""
+    return backfill_symbols(
+        md,
+        watchlist.symbols,
+        years,
+        now=now,
+        session_factory=session_factory,
+        force=force,
+    )
 
 
 def ingest_latest_prices(
@@ -112,3 +132,24 @@ def iter_batches(items: list, size: int) -> Iterator[list]:
     """Yield ``items`` in chunks of at most ``size`` (Alpaca multi-symbol cap)."""
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
+
+def make_market_data(settings) -> MarketData:
+    """Pick a market-data provider.
+
+    Prefers yfinance for backfill (free, no keys). Falls back to Alpaca when
+    explicitly configured with credentials.
+    """
+    from sentinel.ingestion.yfinance_source import YFinanceMarketData
+
+    if settings.backfill_source == "alpaca":
+        if not settings.has_alpaca_credentials:
+            raise ValueError("backfill_source=alpaca but Alpaca credentials are unset")
+        from sentinel.ingestion.alpaca import AlpacaMarketData
+
+        return AlpacaMarketData(
+            settings.alpaca_api_key,
+            settings.alpaca_secret_key,
+            settings.alpaca_data_feed,
+        )
+    return YFinanceMarketData()

@@ -47,6 +47,11 @@ def watchlist(
             as_of=r.as_of,
             stale=_is_stale(r.as_of, now),
             spark=r.spark,
+            conviction=r.conviction,
+            confidence=r.confidence,
+            technical_score=r.technical_score,
+            signal=r.signal,
+            drivers=r.drivers,
         )
         for r in rows
     ]

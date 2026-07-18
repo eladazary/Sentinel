@@ -7,6 +7,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# libgomp1 is the OpenMP runtime LightGBM links against at import time.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies first (declared in pyproject) for better layer caching.
 COPY pyproject.toml ./
 COPY src ./src

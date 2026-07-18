@@ -4,14 +4,14 @@ reused by both the API and the worker."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from sentinel.models import DailyBar, LatestPrice
+from sentinel.models import DailyBar, LatestPrice, SignalSnapshot
 
 # Columns that get overwritten on an (symbol, ts) conflict during bar upsert.
 _BAR_UPDATE_COLS = ("open", "high", "low", "close", "volume", "trade_count", "vwap")
@@ -96,6 +96,15 @@ def get_latest_prices(session: Session, symbols: list[str]) -> dict[str, LatestP
     return {row.symbol: row for row in session.execute(stmt).scalars()}
 
 
+def get_signal_snapshots(
+    session: Session, symbols: list[str]
+) -> dict[str, SignalSnapshot]:
+    if not symbols:
+        return {}
+    stmt = select(SignalSnapshot).where(SignalSnapshot.symbol.in_(symbols))
+    return {row.symbol: row for row in session.execute(stmt).scalars()}
+
+
 @dataclass
 class WatchlistRow:
     """Denormalised view of one watchlist ticker for the API."""
@@ -108,6 +117,11 @@ class WatchlistRow:
     change_pct: float | None
     as_of: datetime | None
     spark: list[float]
+    conviction: float | None = None
+    confidence: float | None = None
+    technical_score: float | None = None
+    signal: str | None = None
+    drivers: list[str] = field(default_factory=list)
 
 
 def build_watchlist_rows(
@@ -118,6 +132,7 @@ def build_watchlist_rows(
     """Assemble the per-ticker watchlist payload from stored prices and bars."""
     symbols = [sym for sym, _ in tickers]
     latest = get_latest_prices(session, symbols)
+    signals = get_signal_snapshots(session, symbols)
     out: list[WatchlistRow] = []
     for symbol, name in tickers:
         lp = latest.get(symbol)
@@ -129,6 +144,7 @@ def build_watchlist_rows(
             change = price - prev_close
             change_pct = (change / prev_close) * 100.0
         spark = [c for _, c in get_recent_closes(session, symbol, spark_points)]
+        sig = signals.get(symbol)
         out.append(
             WatchlistRow(
                 symbol=symbol,
@@ -139,6 +155,11 @@ def build_watchlist_rows(
                 change_pct=change_pct,
                 as_of=as_of,
                 spark=spark,
+                conviction=sig.conviction if sig else None,
+                confidence=sig.confidence if sig else None,
+                technical_score=sig.technical_score if sig else None,
+                signal=sig.signal if sig else None,
+                drivers=list(sig.drivers) if sig and sig.drivers else [],
             )
         )
     return out

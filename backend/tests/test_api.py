@@ -139,3 +139,28 @@ def test_root_endpoint(client):
     resp = client.get("/")
     assert resp.status_code == 200
     assert resp.json()["service"] == "sentinel"
+
+
+# ---- risk endpoints ----
+
+def test_risk_profiles_ladder(client):
+    resp = client.get("/risk/profiles")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["profiles"]) == 10
+    p1 = body["profiles"][0]
+    p10 = body["profiles"][9]
+    assert p1["max_position_pct"] == 5 and p10["max_position_pct"] == 20
+    assert p1["min_conviction"] == 70 and p10["min_conviction"] == 35
+
+
+def test_risk_profile_single(client):
+    resp = client.get("/risk/profile", params={"risk_factor": 5})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["risk_factor"] == 5
+    assert body["max_exposure_pct"] == 70
+
+
+def test_risk_profile_out_of_range(client):
+    assert client.get("/risk/profile", params={"risk_factor": 11}).status_code == 422

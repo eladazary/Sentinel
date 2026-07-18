@@ -1,16 +1,25 @@
 # Sentinel watchlist — the hand-picked universe of 4–10 large-cap tickers.
 # Edit this file (or point SENTINEL_WATCHLIST_PATH elsewhere) to change the
 # universe. The spec caps this at 10 names; the loader enforces 1–10.
+#
+# sector_etf drives the relative-strength-vs-sector feature. SPY (benchmark) and
+# ^VIX (regime) are configured separately and ingested automatically.
 tickers:
   - symbol: NVDA
     name: NVIDIA
+    sector_etf: XLK
   - symbol: MSFT
     name: Microsoft
+    sector_etf: XLK
   - symbol: AAPL
     name: Apple
+    sector_etf: XLK
   - symbol: AMZN
     name: Amazon
+    sector_etf: XLY
   - symbol: JPM
     name: JPMorgan Chase
+    sector_etf: XLF
   - symbol: XOM
     name: Exxon Mobil
+    sector_etf: XLE

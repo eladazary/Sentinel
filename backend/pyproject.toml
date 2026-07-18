@@ -14,6 +14,12 @@ dependencies = [
     "alpaca-py>=0.33",
     "redis>=5.2",
     "pyyaml>=6.0",
+    # Phase 1: signal model, features, backtesting.
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "lightgbm>=4.5",
+    "scikit-learn>=1.5",
+    "yfinance>=0.2.50",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +31,9 @@ dev = [
 [project.scripts]
 sentinel-worker = "sentinel.worker.main:main"
 sentinel-backfill = "sentinel.cli:backfill_command"
+sentinel-train = "sentinel.cli:train_command"
+sentinel-backtest = "sentinel.cli:backtest_command"
+sentinel-cycle = "sentinel.cli:cycle_command"
 
 [build-system]
 requires = ["setuptools>=68"]

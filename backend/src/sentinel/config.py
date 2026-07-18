@@ -16,10 +16,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Ticker(BaseModel):
-    """A single watchlist entry."""
+    """A single watchlist entry.
+
+    ``sector_etf`` is the sector ETF used for relative-strength features (e.g.
+    XLK for tech names). Optional so a universe can be assembled before sectors
+    are assigned.
+    """
 
     symbol: str
     name: str
+    sector_etf: str | None = None
 
     @field_validator("symbol")
     @classmethod
@@ -33,6 +39,14 @@ class Ticker(BaseModel):
     @classmethod
     def _strip_name(cls, v: str) -> str:
         return v.strip()
+
+    @field_validator("sector_etf")
+    @classmethod
+    def _normalize_sector(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip().upper()
+        return v or None
 
 
 class Watchlist(BaseModel):
@@ -60,6 +74,17 @@ class Watchlist(BaseModel):
             if t.symbol == symbol:
                 return t.name
         return None
+
+    def sector_for(self, symbol: str) -> str | None:
+        for t in self.tickers:
+            if t.symbol == symbol:
+                return t.sector_etf
+        return None
+
+    @property
+    def sector_etfs(self) -> list[str]:
+        """Distinct sector ETFs referenced by the watchlist."""
+        return sorted({t.sector_etf for t in self.tickers if t.sector_etf})
 
 
 def load_watchlist(path: str | Path) -> Watchlist:
@@ -104,6 +129,33 @@ class Settings(BaseSettings):
     # Ingestion behaviour.
     backfill_years: int = Field(default=5, ge=1, le=20)
     ingest_interval_seconds: int = Field(default=60, ge=5)
+    # Historical backfill source: "yfinance" (free, no keys) or "alpaca".
+    backfill_source: str = "yfinance"
+
+    # Market context symbols used for relative strength and regime features.
+    benchmark_symbol: str = "SPY"
+    vix_symbol: str = "^VIX"
+
+    # --- Signal model (technical) ---
+    # Predict P(positive excess return over this many trading days).
+    label_horizon_days: int = Field(default=10, ge=1, le=60)
+    # Walk-forward: retrain every N trading days, minimum train window in days.
+    walkforward_train_days: int = Field(default=756, ge=60)  # ~3y
+    walkforward_step_days: int = Field(default=63, ge=1)  # ~1 quarter
+    model_dir: str = "artifacts/models"
+
+    # --- Risk (see spec §6) ---
+    default_risk_factor: int = Field(default=5, ge=1, le=10)
+    # Hard, non-configurable breakers.
+    daily_loss_breaker_pct: float = 3.0
+    max_drawdown_breaker_pct: float = 12.0
+
+    # --- Execution / backtest economics ---
+    starting_equity: float = 100_000.0
+    commission_per_share: float = 0.0
+    slippage_bps: float = 5.0  # basis points applied to fills
+    # Alpaca paper trading endpoint (live uses api.alpaca.markets).
+    alpaca_paper: bool = True
 
     # Watchlist file location (relative paths resolve against backend/).
     watchlist_path: str = "config/watchlist.yaml"
@@ -126,12 +178,29 @@ class Settings(BaseSettings):
             raise ValueError("alpaca_data_feed must be 'iex' or 'sip'")
         return v
 
+    @field_validator("backfill_source")
+    @classmethod
+    def _valid_source(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in {"yfinance", "alpaca"}:
+            raise ValueError("backfill_source must be 'yfinance' or 'alpaca'")
+        return v
+
     @property
     def has_alpaca_credentials(self) -> bool:
         return bool(self.alpaca_api_key and self.alpaca_secret_key)
 
     def load_watchlist(self) -> Watchlist:
         return load_watchlist(self.watchlist_path)
+
+    def context_symbols(self, watchlist: Watchlist) -> list[str]:
+        """All non-watchlist symbols needed for features (benchmark, sectors, VIX)."""
+        extra = {self.benchmark_symbol, self.vix_symbol, *watchlist.sector_etfs}
+        return sorted(extra - set(watchlist.symbols))
+
+    def all_ingest_symbols(self, watchlist: Watchlist) -> list[str]:
+        """Watchlist symbols plus the market-context symbols to backfill."""
+        return watchlist.symbols + self.context_symbols(watchlist)
 
 
 @lru_cache

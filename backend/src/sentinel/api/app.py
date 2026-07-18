@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from sentinel import __version__
-from sentinel.api.routers import health, watchlist
+from sentinel.api.routers import account, health, risk, signals, watchlist
 from sentinel.config import get_settings
 from sentinel.logging_config import configure_logging
 
@@ -32,6 +32,9 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(watchlist.router)
+    app.include_router(risk.router)
+    app.include_router(signals.router)
+    app.include_router(account.router)
 
     @app.get("/", tags=["ops"])
     def root() -> dict:

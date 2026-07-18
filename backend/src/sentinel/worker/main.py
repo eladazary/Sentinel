@@ -14,10 +14,16 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 
 from sentinel.config import get_settings
-from sentinel.db import get_engine
-from sentinel.ingestion.alpaca import AlpacaMarketData
-from sentinel.ingestion.prices import backfill_prices, ingest_latest_prices
+from sentinel.db import get_engine, session_scope
+from sentinel.execution.factory import make_broker
+from sentinel.execution.loop import run_cycle
+from sentinel.ingestion.prices import (
+    backfill_symbols,
+    ingest_latest_prices,
+    make_market_data,
+)
 from sentinel.logging_config import configure_logging, get_logger
+from sentinel.model.technical import TechnicalModel
 from sentinel.redis_client import get_redis
 
 log = get_logger("sentinel.worker")
@@ -69,45 +75,65 @@ def run() -> None:
 
     wait_for_db()
 
-    if not settings.has_alpaca_credentials:
-        log.warning(
-            "ALPACA credentials not set — ingestion is idle. Set "
-            "SENTINEL_ALPACA_API_KEY / SENTINEL_ALPACA_SECRET_KEY to enable "
-            "price backfill and live updates."
-        )
-        while _running:
-            _heartbeat("idle:no-credentials")
-            time.sleep(settings.ingest_interval_seconds)
-        return
-
-    md = AlpacaMarketData(
-        settings.alpaca_api_key,
-        settings.alpaca_secret_key,
-        settings.alpaca_data_feed,
-    )
-
+    # Backfill source is yfinance by default (free, no keys); Alpaca is used for
+    # execution. All ingest symbols = watchlist + benchmark/sector/VIX context.
+    symbols = settings.all_ingest_symbols(watchlist)
+    md = make_market_data(settings)
+    log.info("backfilling %d symbols via %s", len(symbols), settings.backfill_source)
     try:
-        backfill_prices(md, watchlist, settings.backfill_years)
+        backfill_symbols(md, symbols, settings.backfill_years)
     except Exception:  # noqa: BLE001 - never crash the loop on a backfill error
-        log.exception("backfill failed; continuing to live polling")
+        log.exception("backfill failed; continuing")
+
+    model = _load_model(settings)
+    broker = make_broker(settings)
 
     log.info(
-        "entering live polling loop (every %ds)", settings.ingest_interval_seconds
+        "entering loop (every %ds): ingest prices → compute signals → paper cycle",
+        settings.ingest_interval_seconds,
     )
     while _running:
         try:
-            ingest_latest_prices(md, watchlist.symbols)
-            _heartbeat("ok")
+            ingest_latest_prices(md, symbols)
         except Exception:  # noqa: BLE001 - keep the loop alive
-            log.exception("latest-price ingestion cycle failed")
-            _heartbeat("error")
-        # Sleep in short slices so signals are handled promptly.
+            log.exception("latest-price ingestion failed")
+
+        if model is not None:
+            try:
+                report = run_cycle(
+                    session_factory=session_scope,
+                    settings=settings,
+                    watchlist=watchlist,
+                    broker=broker,
+                    model=model,
+                    enforce_entry_window=True,  # no off-hours order placement
+                )
+                _heartbeat(f"ok:{len(report.actions)} decisions")
+            except Exception:  # noqa: BLE001
+                log.exception("trading cycle failed")
+                _heartbeat("error:cycle")
+        else:
+            _heartbeat("ok:no-model (run sentinel-train)")
+
         for _ in range(settings.ingest_interval_seconds):
             if not _running:
                 break
             time.sleep(1)
 
     log.info("worker stopped")
+
+
+def _load_model(settings) -> TechnicalModel | None:
+    try:
+        model = TechnicalModel.load(settings.model_dir)
+        log.info("loaded technical model (trained through %s)", model.trained_through)
+        return model
+    except Exception:  # noqa: BLE001 - model is optional until trained
+        log.warning(
+            "no technical model in %s — signals disabled until `sentinel-train` runs",
+            settings.model_dir,
+        )
+        return None
 
 
 def main() -> None:
