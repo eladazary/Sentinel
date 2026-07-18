@@ -58,6 +58,8 @@ def upsert_signal_snapshot(
     technical_score: float | None,
     signal: str,
     drivers: list[str],
+    news_score: float | None = None,
+    social_score: float | None = None,
     model_version: str | None = None,
 ) -> None:
     stmt = insert(SignalSnapshot).values(
@@ -66,6 +68,8 @@ def upsert_signal_snapshot(
         conviction=conviction,
         confidence=confidence,
         technical_score=technical_score,
+        news_score=news_score,
+        social_score=social_score,
         signal=signal,
         drivers=drivers,
         model_version=model_version,
@@ -77,6 +81,8 @@ def upsert_signal_snapshot(
             "conviction": stmt.excluded.conviction,
             "confidence": stmt.excluded.confidence,
             "technical_score": stmt.excluded.technical_score,
+            "news_score": stmt.excluded.news_score,
+            "social_score": stmt.excluded.social_score,
             "signal": stmt.excluded.signal,
             "drivers": stmt.excluded.drivers,
             "model_version": stmt.excluded.model_version,

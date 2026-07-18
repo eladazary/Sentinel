@@ -95,6 +95,8 @@ def patched_loop(monkeypatch):
         lambda s, sym: pd.DataFrame({"close": [100.0, 101.0, 100.0]}),
     )
     monkeypatch.setattr(loop_mod, "_day_start_and_hwm", lambda s, n, e: (e, e))
+    monkeypatch.setattr(loop_mod, "get_sentiment_cache", lambda s, syms: {})
+    monkeypatch.setattr(loop_mod, "is_in_blackout", lambda s, sym, n, h: False)
     monkeypatch.setattr(
         loop_mod.dlog, "log_decision",
         lambda session, **kw: logged.append({"action": kw["action"], "symbol": kw["symbol"]}),

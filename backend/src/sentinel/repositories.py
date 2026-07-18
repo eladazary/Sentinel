@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from sentinel.models import DailyBar, LatestPrice, SignalSnapshot
+from sentinel.models import DailyBar, LatestPrice, SentimentCache, SignalSnapshot
 
 # Columns that get overwritten on an (symbol, ts) conflict during bar upsert.
 _BAR_UPDATE_COLS = ("open", "high", "low", "close", "volume", "trade_count", "vwap")
@@ -105,6 +105,15 @@ def get_signal_snapshots(
     return {row.symbol: row for row in session.execute(stmt).scalars()}
 
 
+def get_sentiment_cache(
+    session: Session, symbols: list[str]
+) -> dict[str, SentimentCache]:
+    if not symbols:
+        return {}
+    stmt = select(SentimentCache).where(SentimentCache.symbol.in_(symbols))
+    return {row.symbol: row for row in session.execute(stmt).scalars()}
+
+
 @dataclass
 class WatchlistRow:
     """Denormalised view of one watchlist ticker for the API."""
@@ -120,6 +129,9 @@ class WatchlistRow:
     conviction: float | None = None
     confidence: float | None = None
     technical_score: float | None = None
+    news_score: float | None = None
+    social_score: float | None = None
+    crowding: bool = False
     signal: str | None = None
     drivers: list[str] = field(default_factory=list)
 
@@ -133,6 +145,7 @@ def build_watchlist_rows(
     symbols = [sym for sym, _ in tickers]
     latest = get_latest_prices(session, symbols)
     signals = get_signal_snapshots(session, symbols)
+    sentiment = get_sentiment_cache(session, symbols)
     out: list[WatchlistRow] = []
     for symbol, name in tickers:
         lp = latest.get(symbol)
@@ -145,6 +158,7 @@ def build_watchlist_rows(
             change_pct = (change / prev_close) * 100.0
         spark = [c for _, c in get_recent_closes(session, symbol, spark_points)]
         sig = signals.get(symbol)
+        sc = sentiment.get(symbol)
         out.append(
             WatchlistRow(
                 symbol=symbol,
@@ -158,8 +172,22 @@ def build_watchlist_rows(
                 conviction=sig.conviction if sig else None,
                 confidence=sig.confidence if sig else None,
                 technical_score=sig.technical_score if sig else None,
+                news_score=sig.news_score if sig else None,
+                social_score=sig.social_score if sig else None,
+                crowding=bool(sc.social_crowding) if sc else False,
                 signal=sig.signal if sig else None,
                 drivers=list(sig.drivers) if sig and sig.drivers else [],
             )
         )
     return out
+
+
+def recent_news(session: Session, limit: int = 50, symbol: str | None = None):
+    from sentinel.models import NewsItemRow
+
+    stmt = select(NewsItemRow).order_by(NewsItemRow.ts.desc()).limit(limit)
+    if symbol:
+        stmt = select(NewsItemRow).where(NewsItemRow.symbol == symbol).order_by(
+            NewsItemRow.ts.desc()
+        ).limit(limit)
+    return list(session.execute(stmt).scalars())

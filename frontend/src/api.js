@@ -27,8 +27,15 @@ export const fetchRiskProfiles = () => getJSON("/risk/profiles");
 export const fetchAccount = () => getJSON("/account");
 export const fetchDecisions = (limit = 40) => getJSON(`/decisions?limit=${limit}`);
 export const fetchLatestBacktest = () => getJSON("/backtest/latest");
+export const fetchNews = (limit = 30) => getJSON(`/news?limit=${limit}`);
+export const fetchTrackers = () => getJSON("/trackers");
+export const fetchPerformance = () => getJSON("/performance");
 
 export const setRiskFactor = (risk_factor) =>
   send("/risk/factor", "PUT", { risk_factor });
 export const killSwitch = (flatten = true) =>
   send(`/kill?flatten=${flatten}`, "POST");
+export const addTracker = (handle, source) =>
+  send("/trackers", "POST", { handle, source });
+export const removeTracker = (source, handle) =>
+  send(`/trackers/${source}/${encodeURIComponent(handle)}`, "DELETE");

@@ -26,10 +26,12 @@ from sentinel.features.engineering import FEATURE_COLUMNS
 from sentinel.logging_config import get_logger
 from sentinel.model.technical import TechnicalModel
 from sentinel.models import EquitySnapshot
+from sentinel.news.earnings import is_in_blackout
+from sentinel.repositories import get_sentiment_cache
 from sentinel.risk.breakers import check_breakers, validate_order
 from sentinel.risk.manager import size_position
 from sentinel.risk.profile import risk_profile
-from sentinel.signals.engine import DEFAULT_WEIGHTS, derive_signal, fuse
+from sentinel.signals.engine import SubScore, derive_signal, fuse
 from sentinel.signals.technical_signal import technical_subscore
 
 log = get_logger("sentinel.execution.loop")
@@ -124,6 +126,7 @@ def run_cycle(
             log.warning("breaker tripped: %s", reason)
             return report
 
+        sentiment = get_sentiment_cache(session, watchlist.symbols)
         new_today = 0
         for t in watchlist.tickers:
             symbol = t.symbol
@@ -152,13 +155,30 @@ def run_cycle(
                 continue
 
             row = feats.iloc[-1]
-            sub = technical_subscore(model, row, DEFAULT_WEIGHTS["technical"])
-            conv = fuse([sub])
+            subs = [technical_subscore(model, row, settings.weight_technical)]
+            sc = sentiment.get(symbol)
+            news_score = social_score = None
+            if sc is not None:
+                if sc.news_score is not None:
+                    news_score = sc.news_score
+                    subs.append(SubScore(
+                        "news", sc.news_score, sc.news_confidence or 0.0,
+                        settings.weight_news, list(sc.news_drivers or []),
+                    ))
+                if sc.social_score is not None:
+                    social_score = sc.social_score
+                    subs.append(SubScore(
+                        "social", sc.social_score, sc.social_confidence or 0.0,
+                        settings.weight_social, list(sc.social_drivers or []),
+                    ))
+            conv = fuse(subs)
+            tech_sub = subs[0]
             signal = derive_signal(conv.conviction, gate, has_position)
 
             dlog.upsert_signal_snapshot(
                 session, symbol=symbol, ts=now, conviction=conv.conviction,
-                confidence=conv.confidence, technical_score=sub.score,
+                confidence=conv.confidence, technical_score=tech_sub.score,
+                news_score=news_score, social_score=social_score,
                 signal=signal, drivers=conv.drivers,
                 model_version=model.trained_through,
             )
@@ -219,10 +239,26 @@ def run_cycle(
                 report.add(symbol, "SKIP", "no price")
                 continue
 
+            # ---- earnings blackout (spec §6) ----
+            blackout = is_in_blackout(session, symbol, now, settings.earnings_blackout_hours)
+            earnings_size_mult = 1.0
+            if blackout:
+                policy = profile.trade_around_earnings
+                if policy == "never":
+                    dlog.log_decision(
+                        session, ts=now, symbol=symbol, action="SKIP", signal=signal,
+                        reason="earnings blackout (risk profile: never trade around earnings)",
+                        **common,
+                    )
+                    report.add(symbol, "SKIP", "earnings blackout")
+                    continue
+                if policy == "reduced":
+                    earnings_size_mult = 0.5
+
             atr = float(row["atr_pct"]) * last_price
             sizing = size_position(
-                equity=account.equity, price=last_price, atr=atr, profile=profile,
-                current_exposure_value=invested,
+                equity=account.equity * earnings_size_mult, price=last_price, atr=atr,
+                profile=profile, current_exposure_value=invested,
             )
             if sizing.blocked:
                 dlog.log_decision(

@@ -34,6 +34,9 @@ class WatchlistTicker(BaseModel):
     conviction: float | None = None
     confidence: float | None = None
     technical_score: float | None = None
+    news_score: float | None = None
+    social_score: float | None = None
+    crowding: bool = False
     signal: str | None = None
     drivers: list[str] = []
 
@@ -101,6 +104,43 @@ class AccountResponse(BaseModel):
     exposure_pct: float | None = None
     positions: list[PositionOut] = []
     detail: str | None = None
+
+
+class NewsOut(BaseModel):
+    id: int
+    symbol: str
+    ts: datetime
+    source: str
+    headline: str
+    url: str | None
+    event_type: str | None
+    materiality: int | None
+    sentiment_score: float | None
+    impact: float | None
+
+
+class TrackerOut(BaseModel):
+    handle: str
+    source: str
+    credibility: float
+    hit_rate: float | None
+    n_calls: int
+    n_scored: int
+    pinned: bool
+    note: str | None
+    last_seen: datetime | None
+
+
+class PerformancePoint(BaseModel):
+    ts: datetime
+    equity: float
+    drawdown_pct: float
+    spy: float | None
+
+
+class PerformanceResponse(BaseModel):
+    starting_equity: float
+    points: list[PerformancePoint]
 
 
 class BacktestOut(BaseModel):

@@ -119,6 +119,97 @@ class EquitySnapshot(Base):
     mode: Mapped[str] = mapped_column(String(8), nullable=False)
 
 
+class NewsItemRow(Base):
+    """A scored news/filing item (for the news feed)."""
+
+    __tablename__ = "news_items"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    external_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    headline: Mapped[str] = mapped_column(Text, nullable=False)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_type: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    materiality: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sentiment_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    impact: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class SentimentCache(Base):
+    """Latest per-ticker news & social aggregates, produced by the sentiment
+    refresh job and read by the trading loop to fuse the full ensemble."""
+
+    __tablename__ = "sentiment_cache"
+
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    news_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    news_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    news_drivers: Mapped[Any] = mapped_column(JSON, nullable=False, default=list)
+    social_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    social_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    social_crowding: Mapped[bool] = mapped_column(default=False)
+    social_drivers: Mapped[Any] = mapped_column(JSON, nullable=False, default=list)
+
+
+class TrackedAccount(Base):
+    """A curated social account whose credibility is earned from measured accuracy."""
+
+    __tablename__ = "tracked_accounts"
+
+    handle: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source: Mapped[str] = mapped_column(String(16), primary_key=True)
+    credibility: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
+    hit_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    n_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    n_scored: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pinned: Mapped[bool] = mapped_column(default=False)
+    active: Mapped[bool] = mapped_column(default=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_seen: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class TrackerCall(Base):
+    """A directional call by a tracked account, scored at +5 and +20 trading days."""
+
+    __tablename__ = "tracker_calls"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    handle: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    stance: Mapped[float] = mapped_column(Float, nullable=False)  # +1 bull / -1 bear
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    price_at_call: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ret_5d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ret_20d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hit_5d: Mapped[bool | None] = mapped_column(nullable=True)
+    hit_20d: Mapped[bool | None] = mapped_column(nullable=True)
+    scored_20d: Mapped[bool] = mapped_column(default=False)
+
+
+class EarningsEvent(Base):
+    """Upcoming/known earnings dates per symbol (for the blackout window)."""
+
+    __tablename__ = "earnings_events"
+
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    earnings_date: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True
+    )
+    eps_estimate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class BacktestRun(Base):
     """A stored walk-forward backtest run and its results."""
 

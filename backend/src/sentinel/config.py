@@ -157,6 +157,43 @@ class Settings(BaseSettings):
     # Alpaca paper trading endpoint (live uses api.alpaca.markets).
     alpaca_paper: bool = True
 
+    # --- Phase 2: news & social sentiment ---
+    # Sentiment scorer: "finbert" (local, offline), "claude" (API), or "lexicon".
+    sentiment_engine: str = "finbert"
+    # Event classification uses Claude when a key is present; else rule-based.
+    anthropic_api_key: str | None = None
+    anthropic_model: str = "claude-haiku-4-5-20251001"
+
+    # News sources (free tiers; EDGAR/StockTwits need no key).
+    finnhub_api_key: str | None = None
+    # SEC EDGAR requires a descriptive User-Agent with contact info.
+    sec_user_agent: str = "Sentinel/0.1 (contact: set SENTINEL_SEC_USER_AGENT)"
+
+    # Social sources.
+    reddit_client_id: str | None = None
+    reddit_client_secret: str | None = None
+    reddit_user_agent: str = "sentinel/0.1"
+    reddit_subreddits: list[str] = Field(
+        default_factory=lambda: ["stocks", "investing", "wallstreetbets"]
+    )
+
+    # Decay half-lives.
+    news_half_life_days: float = 2.0
+    earnings_news_half_life_days: float = 5.0
+    social_half_life_hours: float = 24.0
+
+    # Ensemble weights (spec §5). Social starts reduced until it has ~3 months of
+    # live-shadow evidence (spec §8).
+    weight_technical: float = 0.45
+    weight_news: float = 0.30
+    weight_social: float = 0.10
+
+    # Crowding: one-sided retail sentiment above this percentile is a contrarian
+    # warning (spec §5C).
+    crowding_threshold: float = 0.90
+    # Earnings blackout: tighten risk within this many hours of earnings.
+    earnings_blackout_hours: int = 48
+
     # Watchlist file location (relative paths resolve against backend/).
     watchlist_path: str = "config/watchlist.yaml"
 
@@ -186,9 +223,29 @@ class Settings(BaseSettings):
             raise ValueError("backfill_source must be 'yfinance' or 'alpaca'")
         return v
 
+    @field_validator("sentiment_engine")
+    @classmethod
+    def _valid_sentiment(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in {"finbert", "claude", "lexicon"}:
+            raise ValueError("sentiment_engine must be 'finbert', 'claude', or 'lexicon'")
+        return v
+
     @property
     def has_alpaca_credentials(self) -> bool:
         return bool(self.alpaca_api_key and self.alpaca_secret_key)
+
+    @property
+    def has_anthropic_key(self) -> bool:
+        return bool(self.anthropic_api_key)
+
+    @property
+    def has_finnhub_key(self) -> bool:
+        return bool(self.finnhub_api_key)
+
+    @property
+    def has_reddit_credentials(self) -> bool:
+        return bool(self.reddit_client_id and self.reddit_client_secret)
 
     def load_watchlist(self) -> Watchlist:
         return load_watchlist(self.watchlist_path)

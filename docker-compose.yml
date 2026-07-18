@@ -80,6 +80,7 @@ services:
         condition: service_healthy
     volumes:
       - model_artifacts:/app/artifacts
+      - hf_cache:/root/.cache/huggingface  # persist the FinBERT download
 
   frontend:
     build: ./frontend
@@ -91,3 +92,4 @@ services:
 volumes:
   timescale_data:
   model_artifacts:
+  hf_cache:

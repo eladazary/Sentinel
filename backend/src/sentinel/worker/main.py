@@ -24,7 +24,10 @@ from sentinel.ingestion.prices import (
 )
 from sentinel.logging_config import configure_logging, get_logger
 from sentinel.model.technical import TechnicalModel
+from sentinel.nlp.events import make_event_classifier
+from sentinel.nlp.sentiment import make_sentiment_scorer
 from sentinel.redis_client import get_redis
+from sentinel.sentiment_jobs import refresh_sentiment
 
 log = get_logger("sentinel.worker")
 
@@ -88,8 +91,15 @@ def run() -> None:
     model = _load_model(settings)
     broker = make_broker(settings)
 
+    # FinBERT + event classifier are built once (FinBERT load is expensive).
+    sentiment_scorer = make_sentiment_scorer(settings)
+    event_classifier = make_event_classifier(settings)
+    # Refresh news/social on a slower cadence than the trading loop (rate limits).
+    refresh_every = max(1, 300 // settings.ingest_interval_seconds)
+    cycle_count = 0
+
     log.info(
-        "entering loop (every %ds): ingest prices → compute signals → paper cycle",
+        "entering loop (every %ds): ingest prices → [sentiment] → signals → paper cycle",
         settings.ingest_interval_seconds,
     )
     while _running:
@@ -97,6 +107,16 @@ def run() -> None:
             ingest_latest_prices(md, symbols)
         except Exception:  # noqa: BLE001 - keep the loop alive
             log.exception("latest-price ingestion failed")
+
+        if cycle_count % refresh_every == 0:
+            try:
+                refresh_sentiment(
+                    session_factory=session_scope, settings=settings,
+                    watchlist=watchlist, sentiment=sentiment_scorer,
+                    classifier=event_classifier,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("sentiment refresh failed")
 
         if model is not None:
             try:
@@ -115,6 +135,7 @@ def run() -> None:
         else:
             _heartbeat("ok:no-model (run sentinel-train)")
 
+        cycle_count += 1
         for _ in range(settings.ingest_interval_seconds):
             if not _running:
                 break

@@ -50,6 +50,9 @@ def watchlist(
             conviction=r.conviction,
             confidence=r.confidence,
             technical_score=r.technical_score,
+            news_score=r.news_score,
+            social_score=r.social_score,
+            crowding=r.crowding,
             signal=r.signal,
             drivers=r.drivers,
         )
