@@ -143,6 +143,58 @@ class PerformanceResponse(BaseModel):
     points: list[PerformancePoint]
 
 
+class CriterionOut(BaseModel):
+    key: str
+    label: str
+    passed: bool
+    detail: str
+    value: float | int | None
+    threshold: float | int | None
+
+
+class GateOut(BaseModel):
+    passed: bool
+    dry_run_started_at: str | None
+    criteria: list[CriterionOut]
+
+
+class ModeOut(BaseModel):
+    mode: str
+    dry_run_started_at: datetime | None
+    last_breaker_at: datetime | None
+    live_unlocked_at: datetime | None
+    live_capital_cap: float | None
+    in_cooloff: bool
+
+
+class UnlockOut(BaseModel):
+    ok: bool
+    mode: str
+    reason: str
+    live_capital_cap: float | None = None
+
+
+class BreakerOut(BaseModel):
+    id: int
+    ts: datetime
+    kind: str
+    detail: str
+    day_pnl_pct: float | None
+    drawdown_pct: float | None
+    acknowledged: bool
+
+
+class SampleDecisionOut(BaseModel):
+    id: int
+    ts: datetime
+    symbol: str
+    action: str
+    signal: str
+    conviction: float
+    reason: str
+    drivers: list[str]
+
+
 class BacktestOut(BaseModel):
     id: int
     created_at: datetime

@@ -3,6 +3,8 @@ import {
   fetchWatchlist, fetchHealth, fetchRiskProfiles, fetchAccount, fetchDecisions,
   fetchLatestBacktest, fetchNews, fetchTrackers, fetchPerformance,
   setRiskFactor, killSwitch, addTracker, removeTracker,
+  fetchGolive, fetchMode, fetchBreakers, sampleDecisions, reviewDecision,
+  ackBreaker, unlockLive,
 } from "./api.js";
 
 /* Sentinel — Phase 2 command deck. Full ensemble (technical + news + social),
@@ -175,6 +177,74 @@ function SentimentDesk({ trackers, onAdd, onRemove }) {
   );
 }
 
+function GoLivePanel({ gate, mode, breakers, onReview, onAck, onUnlock }) {
+  const [reviewing, setReviewing] = useState([]);
+  const [confirm, setConfirm] = useState("");
+  const [unlockMsg, setUnlockMsg] = useState(null);
+  if (!gate) return null;
+
+  const startReview = async () => setReviewing(await sampleDecisions(20));
+  const approve = async (id) => { await onReview(id); setReviewing((r) => r.filter((d) => d.id !== id)); };
+  const doUnlock = async () => { const r = await onUnlock(confirm); setUnlockMsg(r); };
+  const unacked = (breakers || []).filter((b) => !b.acknowledged);
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>Dry-run → Go-live</h2>
+        <span className="head-note">
+          {mode?.mode || "DRY_RUN"}{mode?.dry_run_started_at ? ` · since ${dateOf(mode.dry_run_started_at)}` : ""}
+          {mode?.in_cooloff ? " · ⏳ cool-off active" : ""}
+        </span>
+      </div>
+      <div className={"gate-banner " + (gate.passed ? "ok" : "no")}>
+        {gate.passed ? "✓ All criteria met — LIVE can be unlocked" : "Gate not yet met — staying in dry-run"}
+      </div>
+      <ul className="gate">
+        {gate.criteria.map((c) => (
+          <li key={c.key} className="gate-row">
+            <span className="gate-mark" style={{ color: c.passed ? C.teal : C.coral }}>{c.passed ? "✓" : "○"}</span>
+            <div><span className="gate-l">{c.label}</span><span className="gate-d">{c.detail}</span></div>
+          </li>
+        ))}
+      </ul>
+
+      {unacked.length > 0 && (
+        <div className="gate-sub">
+          <p className="gate-sub-t">Breaker events to review ({unacked.length})</p>
+          {unacked.map((b) => (
+            <div key={b.id} className="brk-row">
+              <span className="mono">{dateOf(b.ts)} · {b.kind}</span>
+              <span className="brk-d">{b.detail}</span>
+              <button onClick={() => onAck(b.id)}>ack</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="gate-sub">
+        <div className="review-head">
+          <p className="gate-sub-t">Manual decision review</p>
+          <button className="ghost-btn" onClick={startReview}>Load 20 to review</button>
+        </div>
+        {reviewing.map((dcn) => (
+          <div key={dcn.id} className="rev-row">
+            <span className="mono">{dcn.symbol} · {dcn.action}</span>
+            <span className="rev-r">{dcn.reason}</span>
+            <button onClick={() => approve(dcn.id)}>✓ ok</button>
+          </div>
+        ))}
+      </div>
+
+      <div className="gate-sub unlock">
+        <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder='type "GO LIVE" to unlock' />
+        <button className="unlock-btn" onClick={doUnlock}>Unlock LIVE (capped)</button>
+        {unlockMsg && <span className="unlock-msg" style={{ color: unlockMsg.ok ? C.teal : C.coral }}>{unlockMsg.reason}</span>}
+      </div>
+    </section>
+  );
+}
+
 function BacktestCard({ bt }) {
   if (!bt) return <section className="panel"><div className="panel-head"><h2>Backtest</h2></div><p className="empty">No backtest stored — run sentinel-backtest.</p></section>;
   const m = bt.metrics || {}, spy = bt.benchmarks?.spy_buy_hold, basket = bt.benchmarks?.basket_buy_hold;
@@ -208,11 +278,12 @@ export default function App() {
 
   const load = useCallback(async () => {
     try {
-      const [wl, health, account, risk, decisions, bt, news, trackers, perf] = await Promise.all([
+      const [wl, health, account, risk, decisions, bt, news, trackers, perf, gate, mode, breakers] = await Promise.all([
         fetchWatchlist(), fetchHealth(), fetchAccount(), fetchRiskProfiles(),
         fetchDecisions(40), fetchLatestBacktest(), fetchNews(30), fetchTrackers(), fetchPerformance(),
+        fetchGolive(), fetchMode(), fetchBreakers(),
       ]);
-      setD({ wl, health, account, risk, decisions: decisions || [], bt, news: news || [], trackers: trackers || [], perf });
+      setD({ wl, health, account, risk, decisions: decisions || [], bt, news: news || [], trackers: trackers || [], perf, gate, mode, breakers: breakers || [] });
       setError(null);
     } catch (e) { setError(e.message || "connection error"); }
   }, []);
@@ -224,7 +295,7 @@ export default function App() {
   const onAddTracker = async (h, s) => { await addTracker(h, s); load(); };
   const onRemoveTracker = async (s, h) => { await removeTracker(s, h); load(); };
 
-  const { wl, health, account, risk = { profiles: [], default_risk_factor: 5 }, decisions = [], bt, news = [], trackers = [], perf } = d;
+  const { wl, health, account, risk = { profiles: [], default_risk_factor: 5 }, decisions = [], bt, news = [], trackers = [], perf, gate: goliveGate, mode: sysMode, breakers = [] } = d;
   const mode = wl?.mode || account?.mode || "—";
   const healthy = health?.status === "ok";
   const tickers = wl?.tickers || [];
@@ -252,6 +323,13 @@ export default function App() {
       {error && <div className="banner">Can’t reach the API — retrying every {POLL_MS / 1000}s. ({error})</div>}
 
       <Dial profiles={risk.profiles} current={risk.default_risk_factor} onCommit={commitRisk} />
+
+      <GoLivePanel
+        gate={goliveGate} mode={sysMode} breakers={breakers}
+        onReview={async (id) => { await reviewDecision(id); load(); }}
+        onAck={async (id) => { await ackBreaker(id); load(); }}
+        onUnlock={async (phrase) => { const r = await unlockLive(phrase); load(); return r; }}
+      />
 
       <section className="panel">
         <div className="panel-head"><h2>Watchlist</h2>
@@ -437,6 +515,25 @@ h2 { font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: $
 .bt th:first-child { text-align: left; }
 .bt td { text-align: right; padding: 5px 6px; font-size: 12px; border-top: 1px solid ${C.line}; }
 .bt .bt-l { text-align: left; color: ${C.mut}; font-size: 11px; } .bt .dim { color: ${C.mut}; }
+.gate-banner { font-size: 12px; border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; }
+.gate-banner.ok { color: ${C.teal}; border: 1px solid ${C.teal}55; background: ${C.teal}11; }
+.gate-banner.no { color: ${C.mut}; border: 1px solid ${C.line}; background: ${C.panel2}; }
+.gate { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.gate-row { display: grid; grid-template-columns: 20px 1fr; gap: 8px; align-items: baseline; }
+.gate-mark { font-size: 14px; font-weight: 700; }
+.gate-l { font-size: 12.5px; display: block; }
+.gate-d { font-size: 11px; color: ${C.mut}; }
+.gate-sub { margin-top: 14px; border-top: 1px solid ${C.line}; padding-top: 12px; }
+.gate-sub-t { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: ${C.mut}; margin-bottom: 8px; }
+.review-head { display: flex; justify-content: space-between; align-items: center; }
+.ghost-btn, .gate-sub button { background: transparent; border: 1px solid ${C.line}; color: ${C.mut}; border-radius: 6px; padding: 5px 10px; font-size: 11px; cursor: pointer; }
+.ghost-btn:hover, .gate-sub button:hover { color: ${C.ink}; border-color: ${C.mut}; }
+.rev-row, .brk-row { display: grid; grid-template-columns: 130px 1fr auto; gap: 10px; align-items: center; font-size: 11.5px; padding: 5px 0; border-bottom: 1px solid ${C.line}; }
+.rev-r, .brk-d { color: ${C.mut}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.unlock { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.unlock input { flex: 1; min-width: 180px; background: ${C.panel2}; border: 1px solid ${C.line}; color: ${C.ink}; border-radius: 6px; padding: 8px; font-size: 12px; }
+.unlock-btn { background: transparent; border: 1px solid ${C.amber}; color: ${C.amber}; border-radius: 6px; padding: 8px 12px; font-size: 12px; cursor: pointer; }
+.unlock-msg { font-size: 11px; }
 .foot { font-size: 11px; color: ${C.mut}; margin-top: 6px; line-height: 1.5; }
 button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid ${C.amber}; outline-offset: 2px; }
 @media (max-width: 880px) { .two-col { grid-template-columns: 1fr; } .dial-body { grid-template-columns: 1fr; } }

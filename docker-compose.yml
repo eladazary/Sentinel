@@ -71,9 +71,14 @@ services:
     env_file:
       - path: .env
         required: false
+    # Let the container reach an Ollama server running on the Mac host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       SENTINEL_DATABASE_URL: postgresql+psycopg://sentinel:sentinel@timescaledb:5432/sentinel
       SENTINEL_REDIS_URL: redis://redis:6379/0
+      # If SENTINEL_OLLAMA_MODEL is set in .env, reach host Ollama by default.
+      SENTINEL_OLLAMA_BASE_URL: ${SENTINEL_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
     depends_on:
       # Wait for the API so migrations have run before the worker touches tables.
       api:

@@ -97,6 +97,8 @@ def patched_loop(monkeypatch):
     monkeypatch.setattr(loop_mod, "_day_start_and_hwm", lambda s, n, e: (e, e))
     monkeypatch.setattr(loop_mod, "get_sentiment_cache", lambda s, syms: {})
     monkeypatch.setattr(loop_mod, "is_in_blackout", lambda s, sym, n, h: False)
+    monkeypatch.setattr(loop_mod, "ensure_dry_run_started", lambda s, n=None: None)
+    monkeypatch.setattr(loop_mod, "record_breaker_event", lambda s, **kw: None)
     monkeypatch.setattr(
         loop_mod.dlog, "log_decision",
         lambda session, **kw: logged.append({"action": kw["action"], "symbol": kw["symbol"]}),

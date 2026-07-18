@@ -33,6 +33,7 @@ from sentinel.risk.manager import size_position
 from sentinel.risk.profile import risk_profile
 from sentinel.signals.engine import SubScore, derive_signal, fuse
 from sentinel.signals.technical_signal import technical_subscore
+from sentinel.system_state import ensure_dry_run_started, record_breaker_event
 
 log = get_logger("sentinel.execution.loop")
 
@@ -78,6 +79,7 @@ def run_cycle(
     now: datetime | None = None,
     risk_factor: int | None = None,
     enforce_entry_window: bool = True,
+    notifier=None,
 ) -> CycleReport:
     now = now or datetime.now(timezone.utc)
     if risk_factor is None:
@@ -96,6 +98,7 @@ def run_cycle(
     exposure_pct = (invested / account.equity * 100.0) if account.equity > 0 else 0.0
 
     with session_factory() as session:
+        ensure_dry_run_started(session, now)  # start the dry-run clock on first cycle
         # --- hard breakers first ---
         day_start, hwm = _day_start_and_hwm(session, now, account.equity)
         br = check_breakers(
@@ -117,6 +120,11 @@ def run_cycle(
                 conviction=0.0, confidence=0.0, risk_factor=profile.risk_factor,
                 mode=settings.mode, reason=reason, drivers=[],
             )
+            record_breaker_event(
+                session, ts=now,
+                kind="drawdown" if br.drawdown_tripped else "daily_loss",
+                detail=reason, day_pnl_pct=br.day_pnl_pct, drawdown_pct=br.drawdown_pct,
+            )
             dlog.record_equity(
                 session, ts=now, equity=account.equity, cash=account.cash,
                 exposure_pct=0.0, mode=settings.mode,
@@ -124,6 +132,8 @@ def run_cycle(
             report.breaker_tripped = True
             report.add("*", "BREAKER", reason)
             log.warning("breaker tripped: %s", reason)
+            if notifier is not None:
+                notifier.breaker(reason)
             return report
 
         sentiment = get_sentiment_cache(session, watchlist.symbols)
@@ -203,6 +213,8 @@ def run_cycle(
                         broker_order_id=oid, **common,
                     )
                     report.add(symbol, "EXIT", signal)
+                    if notifier is not None:
+                        notifier.fill(symbol, f"{signal} — closed at conviction {conv.conviction:.0f}")
                 else:
                     dlog.log_decision(
                         session, ts=now, symbol=symbol, action="HOLD", signal=signal,
@@ -307,6 +319,12 @@ def run_cycle(
                 sizing=_sizing_dict(sizing), broker_order_id=res.id, **common,
             )
             report.add(symbol, "OPEN", f"{sizing.shares} shares")
+            if notifier is not None:
+                notifier.fill(
+                    symbol,
+                    f"BUY {sizing.shares}@~{limit_price} · stop {sizing.stop_price} "
+                    f"· tp {sizing.take_profit}",
+                )
 
         dlog.record_equity(
             session, ts=now, equity=account.equity, cash=account.cash,

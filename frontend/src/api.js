@@ -39,3 +39,14 @@ export const addTracker = (handle, source) =>
   send("/trackers", "POST", { handle, source });
 export const removeTracker = (source, handle) =>
   send(`/trackers/${source}/${encodeURIComponent(handle)}`, "DELETE");
+
+// Phase 3: go-live gate, mode switch, review.
+export const fetchGolive = () => getJSON("/golive");
+export const fetchMode = () => getJSON("/mode");
+export const fetchBreakers = () => getJSON("/breakers");
+export const sampleDecisions = (n = 20) => getJSON(`/decisions/sample?n=${n}`);
+export const reviewDecision = (id, ok = true, note = null) =>
+  send(`/decisions/${id}/review`, "POST", { ok, note });
+export const ackBreaker = (id) => send(`/breakers/${id}/ack`, "POST");
+export const unlockLive = (confirmation) =>
+  send("/mode/unlock-live", "POST", { confirmation });

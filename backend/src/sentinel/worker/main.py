@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import text
 
+from sentinel.alerts.notifier import make_notifier
 from sentinel.config import get_settings
 from sentinel.db import get_engine, session_scope
 from sentinel.execution.factory import make_broker
@@ -90,6 +91,7 @@ def run() -> None:
 
     model = _load_model(settings)
     broker = make_broker(settings)
+    notifier = make_notifier(settings)
 
     # FinBERT + event classifier are built once (FinBERT load is expensive).
     sentiment_scorer = make_sentiment_scorer(settings)
@@ -127,6 +129,7 @@ def run() -> None:
                     broker=broker,
                     model=model,
                     enforce_entry_window=True,  # no off-hours order placement
+                    notifier=notifier,
                 )
                 _heartbeat(f"ok:{len(report.actions)} decisions")
             except Exception:  # noqa: BLE001

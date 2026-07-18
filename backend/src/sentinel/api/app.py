@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sentinel import __version__
 from sentinel.api.routers import (
     account,
+    golive,
     health,
     performance,
     risk,
@@ -45,6 +46,7 @@ def create_app() -> FastAPI:
     app.include_router(account.router)
     app.include_router(sentiment.router)
     app.include_router(performance.router)
+    app.include_router(golive.router)
 
     @app.get("/", tags=["ops"])
     def root() -> dict:

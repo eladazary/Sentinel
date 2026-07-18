@@ -160,7 +160,10 @@ class Settings(BaseSettings):
     # --- Phase 2: news & social sentiment ---
     # Sentiment scorer: "finbert" (local, offline), "claude" (API), or "lexicon".
     sentiment_engine: str = "finbert"
-    # Event classification uses Claude when a key is present; else rule-based.
+    # Event classification: Ollama (local) if configured, else Claude (if key),
+    # else rule-based. Ollama keeps the whole system self-hosted and key-free.
+    ollama_model: str | None = None  # e.g. "llama3.1"; None disables Ollama
+    ollama_base_url: str = "http://localhost:11434"
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-haiku-4-5-20251001"
 
@@ -193,6 +196,24 @@ class Settings(BaseSettings):
     crowding_threshold: float = 0.90
     # Earnings blackout: tighten risk within this many hours of earnings.
     earnings_blackout_hours: int = 48
+
+    # --- Phase 3: alerting, dry-run gate, live guardrails ---
+    # Alert channels activate when their config is present (log is always on).
+    ntfy_topic: str | None = None
+    ntfy_server: str = "https://ntfy.sh"
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    slack_webhook_url: str | None = None
+
+    # Go-live gate thresholds (spec §10.4).
+    golive_min_trading_days: int = 60
+    golive_min_reviews: int = 20
+    # Paper max drawdown may be at most this multiple of the backtest expectation.
+    golive_drawdown_tolerance: float = 1.5
+
+    # Live guardrails (spec §10.5). Live is capped and cooled-off after breakers.
+    live_capital_cap: float = 10_000.0
+    live_cooloff_hours: int = 24
 
     # Watchlist file location (relative paths resolve against backend/).
     watchlist_path: str = "config/watchlist.yaml"
@@ -238,6 +259,10 @@ class Settings(BaseSettings):
     @property
     def has_anthropic_key(self) -> bool:
         return bool(self.anthropic_api_key)
+
+    @property
+    def has_ollama(self) -> bool:
+        return bool(self.ollama_model)
 
     @property
     def has_finnhub_key(self) -> bool:

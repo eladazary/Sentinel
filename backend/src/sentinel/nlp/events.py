@@ -103,11 +103,60 @@ class ClaudeEventClassifier:
             return self._fallback.classify(headline, body)
 
 
+class OllamaEventClassifier:
+    """Local LLM event classification via Ollama (self-hosted, key-free)."""
+
+    def __init__(self, settings):
+        import httpx
+
+        self._client = httpx
+        self._url = f"{settings.ollama_base_url.rstrip('/')}/api/chat"
+        self._model = settings.ollama_model
+        self._fallback = RuleEventClassifier()
+
+    def classify(self, headline: str, body: str | None = None) -> EventResult:
+        try:
+            resp = self._client.post(
+                self._url,
+                json={
+                    "model": self._model,
+                    "messages": [{
+                        "role": "user",
+                        "content": _PROMPT.format(headline=headline, body=(body or "")[:1500]),
+                    }],
+                    "stream": False,
+                    "format": "json",  # Ollama constrains output to valid JSON
+                    "options": {"temperature": 0},
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            content = resp.json()["message"]["content"]
+            data = json.loads(re.search(r"\{.*\}", content, re.S).group(0))
+            et = str(data.get("event_type", "other")).lower()
+            return EventResult(
+                event_type=et if et in EVENT_TYPES else "other",
+                materiality=int(max(1, min(5, data.get("materiality", 2)))),
+                direction=float(max(-1.0, min(1.0, data.get("direction", 0.0)))),
+                novelty=float(max(0.0, min(1.0, data.get("novelty", 1.0)))),
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail the pipeline on the LLM
+            log.warning("Ollama event classify failed (%s); using rules", type(exc).__name__)
+            return self._fallback.classify(headline, body)
+
+
 class EventClassifier(Protocol):
     def classify(self, headline: str, body: str | None = None) -> EventResult: ...
 
 
 def make_event_classifier(settings) -> EventClassifier:
+    # Prefer local Ollama, then Claude, then transparent rules.
+    if settings.has_ollama:
+        try:
+            log.info("event classifier: Ollama (%s)", settings.ollama_model)
+            return OllamaEventClassifier(settings)
+        except Exception:  # noqa: BLE001
+            log.warning("Ollama init failed; trying next classifier")
     if settings.has_anthropic_key:
         try:
             return ClaudeEventClassifier(settings)

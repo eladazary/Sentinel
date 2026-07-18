@@ -210,6 +210,57 @@ class EarningsEvent(Base):
     )
 
 
+class SystemState(Base):
+    """Single-row operational state (mode, dry-run clock, cool-off, live cap)."""
+
+    __tablename__ = "system_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    mode: Mapped[str] = mapped_column(String(8), nullable=False, default="DRY_RUN")
+    dry_run_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_breaker_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    live_unlocked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    live_capital_cap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class BreakerEvent(Base):
+    """A hard-breaker firing, logged for the go-live gate and post-mortems."""
+
+    __tablename__ = "breaker_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)  # daily_loss/drawdown
+    detail: Mapped[str] = mapped_column(Text, nullable=False)
+    day_pnl_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    drawdown_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Manual sign-off that the firing was correct (not a malfunction).
+    acknowledged: Mapped[bool] = mapped_column(default=False)
+
+
+class DecisionReview(Base):
+    """A manual review of a decision-log entry (spec §10.4 gate: review 20)."""
+
+    __tablename__ = "decision_reviews"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    decision_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+    reviewed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    ok: Mapped[bool] = mapped_column(default=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class BacktestRun(Base):
     """A stored walk-forward backtest run and its results."""
 
