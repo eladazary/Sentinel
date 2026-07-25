@@ -167,9 +167,11 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-haiku-4-5-20251001"
 
-    # News sources (free tiers; EDGAR/StockTwits need no key).
+    # News sources (free tiers; EDGAR needs no key, only a contact address).
     finnhub_api_key: str | None = None
-    # SEC EDGAR requires a descriptive User-Agent with contact info.
+    # SEC EDGAR's access policy requires a User-Agent carrying a real contact
+    # email; it returns 403 for anything that looks like an unidentified bot.
+    # The default below is deliberately invalid — see has_valid_sec_user_agent.
     sec_user_agent: str = "Sentinel/0.1 (contact: set SENTINEL_SEC_USER_AGENT)"
 
     # Social sources.
@@ -251,6 +253,19 @@ class Settings(BaseSettings):
         if v not in {"finbert", "claude", "lexicon"}:
             raise ValueError("sentiment_engine must be 'finbert', 'claude', or 'lexicon'")
         return v
+
+    @property
+    def has_valid_sec_user_agent(self) -> bool:
+        """True when the UA carries a contact address SEC will accept.
+
+        SEC 403s the shipped placeholder, which used to surface as an endless
+        stream of "EDGAR fetch failed" warnings rather than a configuration
+        error. A bare ``@`` check is enough: SEC only wants a reachable contact.
+        """
+        ua = (self.sec_user_agent or "").strip()
+        if "set SENTINEL_SEC_USER_AGENT" in ua:
+            return False
+        return "@" in ua and "." in ua.split("@")[-1]
 
     @property
     def has_alpaca_credentials(self) -> bool:

@@ -28,12 +28,24 @@ _FORM_EVENT = {
 class EdgarSource:
     name = "sec_edgar"
 
-    def __init__(self, user_agent: str):
+    def __init__(self, user_agent: str, *, contact_ok: bool = True):
         self._ua = user_agent
+        self._contact_ok = contact_ok
         self._cik: dict[str, str] | None = None
+        self._warned = False
 
     def available(self) -> bool:
-        return True  # keyless
+        """Keyless, but useless without a contact address SEC will accept."""
+        if not self._contact_ok:
+            if not self._warned:
+                log.error(
+                    "EDGAR disabled: SENTINEL_SEC_USER_AGENT has no contact email, "
+                    "and SEC returns 403 without one. Set it to something like "
+                    "'Sentinel/0.1 (you@example.com)'."
+                )
+                self._warned = True
+            return False
+        return True
 
     def _headers(self) -> dict:
         return {"User-Agent": self._ua, "Accept-Encoding": "gzip, deflate"}
@@ -51,6 +63,8 @@ class EdgarSource:
 
     def fetch(self, symbol: str, since: datetime, limit: int = 50) -> list[NewsItem]:
         items: list[NewsItem] = []
+        if not self.available():
+            return []
         try:
             with httpx.Client() as client:
                 cik = self._load_cik_map(client).get(symbol.upper())

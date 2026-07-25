@@ -90,3 +90,39 @@ def test_pipeline_scores_items():
     assert all(s.impact is not None for s in scored)
     assert agg.n_items == 2
     assert len(agg.drivers) > 0
+
+
+# ---- EDGAR contact requirement (SEC 403s without one) ----
+
+def test_sec_user_agent_validation():
+    from sentinel.config import Settings
+
+    # The shipped default is deliberately invalid.
+    assert Settings().has_valid_sec_user_agent is False
+    assert Settings(
+        sec_user_agent="Sentinel/0.1 (elad@example.com)"
+    ).has_valid_sec_user_agent is True
+    # No contact address at all — SEC rejects these.
+    assert Settings(sec_user_agent="Sentinel/0.1").has_valid_sec_user_agent is False
+    assert Settings(sec_user_agent="").has_valid_sec_user_agent is False
+
+
+def test_edgar_skips_entirely_without_a_contact(monkeypatch):
+    """Must not spend a request to learn what config already tells us."""
+    import httpx
+
+    from sentinel.news.sources.edgar import EdgarSource
+
+    def boom(*a, **kw):
+        raise AssertionError("EDGAR attempted a request with no contact address")
+
+    monkeypatch.setattr(httpx.Client, "get", boom)
+    src = EdgarSource("Sentinel/0.1 (contact: set SENTINEL_SEC_USER_AGENT)", contact_ok=False)
+    assert src.available() is False
+    assert src.fetch("AAPL", datetime(2026, 1, 1, tzinfo=timezone.utc)) == []
+
+
+def test_edgar_is_available_with_a_contact():
+    from sentinel.news.sources.edgar import EdgarSource
+
+    assert EdgarSource("Sentinel/0.1 (a@b.com)", contact_ok=True).available() is True
