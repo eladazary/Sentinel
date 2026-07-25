@@ -14,12 +14,31 @@ def test_risk_profile_hits_spec_anchors():
     p1, p5, p10 = risk_profile(1), risk_profile(5), risk_profile(10)
     assert (p1.max_position_pct, p5.max_position_pct, p10.max_position_pct) == (5, 12, 20)
     assert (p1.max_exposure_pct, p5.max_exposure_pct, p10.max_exposure_pct) == (30, 70, 95)
-    assert (p1.min_conviction, p5.min_conviction, p10.min_conviction) == (70, 50, 35)
     assert (p1.stop_atr_mult, p5.stop_atr_mult, p10.stop_atr_mult) == (1.5, 2.5, 3.5)
     assert (p1.max_new_positions_per_day, p5.max_new_positions_per_day,
             p10.max_new_positions_per_day) == (1, 2, 4)
     assert p1.trade_around_earnings == "never"
     assert p10.trade_around_earnings == "allowed"
+
+
+def test_conviction_gate_is_reachable_by_the_model():
+    """Deliberate deviation from spec §6's 70/50/35 — see profile.py.
+
+    conviction = (p - 0.5) * 200, and the technical model's observed range is
+    roughly [-20, +25]. A gate above that ceiling means no trade can ever fire,
+    so every risk level must sit inside what the model can emit.
+    """
+    p1, p5, p10 = risk_profile(1), risk_profile(5), risk_profile(10)
+    assert (p1.min_conviction, p5.min_conviction, p10.min_conviction) == (20, 12, 5)
+
+    observed_ceiling = 25.0
+    for rf in range(1, 11):
+        gate = risk_profile(rf).min_conviction
+        assert 0 < gate < observed_ceiling, f"risk {rf} gate {gate} is unreachable"
+
+    # Monotonic: more risk must never mean a stricter gate.
+    gates = [risk_profile(rf).min_conviction for rf in range(1, 11)]
+    assert gates == sorted(gates, reverse=True)
 
 
 def test_risk_profile_interpolates_between_anchors():

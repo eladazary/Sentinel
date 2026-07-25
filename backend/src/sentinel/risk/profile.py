@@ -6,11 +6,27 @@ The spec anchors each parameter at Risk 1 / 5 / 10 and says intermediate values
 reproduces every anchor exactly, which the prototype UI's endpoint-only linear
 approximation does not. The API exposes this so the Risk Dial previews exactly
 what the engine will do.
+
+DEVIATION FROM SPEC §6 — the conviction gate. The spec anchors it at 70/50/35,
+but conviction is ``(p - 0.5) * 200`` over the technical model's probability, so
+those gates demand p = 0.85 / 0.75 / 0.675. A daily-bar swing classifier does
+not produce those: across the first 937 logged decisions conviction ranged
+[-19.9, +25.0] with a median of -5.2 and p90 of 13.8, so *every* decision was
+skipped and the system never opened a position. The gate is re-anchored below to
+that measured distribution — see CONVICTION_GATE_ANCHORS.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+
+
+# Conviction gate at Risk 1 / 5 / 10, expressed against what the model can
+# actually emit. In probability terms: 0.60 / 0.56 / 0.525 — a conservative,
+# moderate, and permissive read of a weak-but-real daily edge. Re-derive these if
+# the model is retrained or recalibrated; a gate above ~25 disables trading
+# entirely, which is the bug this replaces.
+CONVICTION_GATE_ANCHORS = (20.0, 12.0, 5.0)
 
 
 def _piecewise(r: float, lo: float, mid: float, hi: float) -> float:
@@ -51,7 +67,7 @@ def risk_profile(risk_factor: int) -> RiskProfile:
         risk_factor=rf,
         max_position_pct=round(_piecewise(rf, 5, 12, 20), 2),
         max_exposure_pct=round(_piecewise(rf, 30, 70, 95), 2),
-        min_conviction=round(_piecewise(rf, 70, 50, 35), 1),
+        min_conviction=round(_piecewise(rf, *CONVICTION_GATE_ANCHORS), 1),
         stop_atr_mult=round(_piecewise(rf, 1.5, 2.5, 3.5), 2),
         max_new_positions_per_day=per_day,
         trade_around_earnings=earnings,
