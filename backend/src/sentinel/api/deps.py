@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
+from fastapi import Depends
 from sqlalchemy.orm import Session
 
 from sentinel.config import Settings, Watchlist, get_settings
@@ -22,5 +23,8 @@ def settings_dep() -> Settings:
     return get_settings()
 
 
-def watchlist_dep() -> Watchlist:
-    return get_settings().load_watchlist()
+def watchlist_dep(db: Session = Depends(get_db)) -> Watchlist:
+    """The universe from the DB (seeded from YAML on first use)."""
+    from sentinel.universe import load_universe
+
+    return load_universe(db, get_settings())

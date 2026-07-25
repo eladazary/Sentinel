@@ -3,6 +3,7 @@ import {
   fetchWatchlist, fetchHealth, fetchRiskProfiles, fetchAccount, fetchDecisions,
   fetchLatestBacktest, fetchNews, fetchTrackers, fetchPerformance,
   setRiskFactor, killSwitch, addTracker, removeTracker,
+  addWatchlistTicker, removeWatchlistTicker,
   fetchGolive, fetchMode, fetchBreakers, sampleDecisions, reviewDecision,
   ackBreaker, unlockLive,
 } from "./api.js";
@@ -123,19 +124,122 @@ function PerfChart({ perf }) {
   const line = (key) => pts.map((p, i) => (p[key] == null ? null : `${X(i)},${Y(p[key])}`))
     .filter(Boolean).join(" ");
   const last = pts[pts.length - 1];
+  const s = perf?.summary;
+  const up = (s?.return_pct ?? 0) >= 0;
   return (
     <section className="panel">
       <div className="panel-head"><h2>Performance</h2>
         <span className="head-note">paper equity vs SPY · dd {fmt(last.drawdown_pct, 1)}%</span></div>
+
+      {s && (
+        <div className="bottom-line">
+          <div className="bl-main">
+            <span className="stat-l">Money now</span>
+            <span className="bl-eq mono">{fmtMoney(s.equity)}</span>
+          </div>
+          <div className="bl-main">
+            <span className="stat-l">Return</span>
+            <span className="bl-ret mono" style={{ color: up ? C.teal : C.coral }}>
+              {up ? "+" : ""}{fmt(s.return_pct, 2)}%
+            </span>
+          </div>
+          <div className="bl-side">
+            <div><dt>P&amp;L</dt><dd className="mono">{s.pnl >= 0 ? "+" : "−"}{fmtMoney(Math.abs(s.pnl)).slice(1)}</dd></div>
+            <div><dt>Positions opened</dt><dd className="mono">{s.positions_opened}</dd></div>
+            <div><dt>Max drawdown</dt><dd className="mono">{fmt(s.max_drawdown_pct, 2)}%</dd></div>
+            <div><dt>SPY, same window</dt><dd className="mono">{s.benchmark_return_pct == null ? "—" : `${fmt(s.benchmark_return_pct, 2)}%`}</dd></div>
+          </div>
+        </div>
+      )}
+      {s?.note && <p className="bl-note">{s.note}</p>}
+      {s?.replay_return_pct != null && (
+        <p className="bl-note">
+          Chart includes {fmt(s.replay_return_pct, 2)}% from the accelerated historical
+          replay — a backtest, excluded from the return above.
+        </p>
+      )}
+
       <svg viewBox="0 0 100 64" style={{ width: "100%", height: 160 }} preserveAspectRatio="none">
         <polyline points={line("spy")} fill="none" stroke={C.mut} strokeWidth="1" strokeDasharray="2 2" />
         <polyline points={line("equity")} fill="none" stroke={C.teal} strokeWidth="1.6" />
       </svg>
       <div className="legend">
         <span><i style={{ background: C.teal }} /> equity {fmtMoney(last.equity)}</span>
-        <span><i style={{ background: C.mut }} /> SPY (normalized)</span>
+        <span><i style={{ background: C.mut }} /> SPY (rebased to window start)</span>
       </div>
     </section>
+  );
+}
+
+// The sector ETF drives the relative-strength-vs-sector feature, so a new
+// ticker without one is missing an input the model expects.
+const SECTOR_ETFS = [
+  ["XLK", "Technology"], ["XLY", "Consumer discretionary"], ["XLF", "Financials"],
+  ["XLE", "Energy"], ["XLV", "Health care"], ["XLI", "Industrials"],
+  ["XLP", "Consumer staples"], ["XLU", "Utilities"], ["XLB", "Materials"],
+  ["XLRE", "Real estate"], ["XLC", "Communication services"],
+];
+
+function AddTicker({ count, max, onAdd }) {
+  const [open, setOpen] = useState(false);
+  const [symbol, setSymbol] = useState("");
+  const [name, setName] = useState("");
+  const [etf, setEtf] = useState("XLK");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const full = count >= max;
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!symbol.trim() || busy) return;
+    setBusy(true); setErr(null);
+    try {
+      await onAdd(symbol.trim().toUpperCase(), name.trim(), etf);
+      setSymbol(""); setName(""); setOpen(false);
+    } catch (e2) {
+      setErr(e2.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <div className="add-bar">
+        <button className="add-open" onClick={() => setOpen(true)} disabled={full}>
+          + Add ticker
+        </button>
+        <span className="head-note">
+          {count} of {max} {full ? "· full, remove one to add another" : "names"}
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <form className="add-form" onSubmit={submit}>
+      <input
+        autoFocus value={symbol} onChange={(e) => setSymbol(e.target.value)}
+        placeholder="SYMBOL" maxLength={16} className="mono add-sym" aria-label="Ticker symbol"
+      />
+      <input
+        value={name} onChange={(e) => setName(e.target.value)}
+        placeholder="Company name (optional)" maxLength={64} className="add-name" aria-label="Company name"
+      />
+      <select value={etf} onChange={(e) => setEtf(e.target.value)} aria-label="Sector ETF">
+        {SECTOR_ETFS.map(([k, label]) => <option key={k} value={k}>{k} · {label}</option>)}
+      </select>
+      <button type="submit" className="add-go" disabled={busy || !symbol.trim()}>
+        {busy ? "Adding…" : "Add"}
+      </button>
+      <button type="button" className="add-cancel" onClick={() => { setOpen(false); setErr(null); }}>
+        Cancel
+      </button>
+      {err && <span className="add-err">{err}</span>}
+      <span className="add-hint">
+        History is backfilled on the next worker cycle — it won't trade until then.
+      </span>
+    </form>
   );
 }
 
@@ -304,6 +408,16 @@ export default function App() {
     return p ? p.min_conviction : 50;
   }, [risk]);
 
+  // Say where the equity number came from. A dash with no explanation reads as
+  // "no positions yet" when it can equally mean "the broker rejected us".
+  const equitySource = useMemo(() => {
+    if (!account) return { label: "—", warn: false };
+    if (!account.available) return { label: "unavailable", warn: true };
+    if (account.source === "ledger")
+      return { label: `ledger · ${dateOf(account.as_of)}`, warn: account.degraded };
+    return { label: "alpaca · live", warn: false };
+  }, [account]);
+
   return (
     <div className="root">
       <style>{css}</style>
@@ -311,7 +425,8 @@ export default function App() {
         <div className="brand"><span className="brand-mark" aria-hidden>◮</span>
           <div><h1>Sentinel</h1><span className="brand-sub">swing desk · phase 2 · full ensemble</span></div></div>
         <div className="top-stats">
-          <div className="stat"><span className="stat-l">Paper equity</span><span className="stat-v mono">{fmtMoney(account?.equity)}</span></div>
+          <div className="stat"><span className="stat-l">Paper equity</span><span className="stat-v mono">{fmtMoney(account?.equity)}</span>
+            <span className={"stat-src" + (equitySource.warn ? " warn" : "")}>{equitySource.label}</span></div>
           <div className="stat"><span className="stat-l">Exposure</span><span className="stat-v mono">{account?.exposure_pct == null ? "—" : `${fmt(account.exposure_pct, 0)}%`}</span></div>
           <span className="mode">{mode}</span>
           <span className="health" style={{ color: healthy ? C.teal : C.coral, borderColor: healthy ? C.teal : C.coral }}>{healthy ? "● ok" : "● degraded"}</span>
@@ -321,6 +436,15 @@ export default function App() {
       </header>
 
       {error && <div className="banner">Can’t reach the API — retrying every {POLL_MS / 1000}s. ({error})</div>}
+
+      {account?.detail && (account.degraded || !account.available) && (
+        <div className="banner warn">
+          <strong>Broker degraded</strong> — {account.detail}.{" "}
+          {account.broker === "sim"
+            ? "Trading is running on the in-memory simulator; the equity shown comes from the worker’s own ledger, not from Alpaca."
+            : "The equity shown comes from the worker’s own ledger."}
+        </div>
+      )}
 
       <Dial profiles={risk.profiles} current={risk.default_risk_factor} onCommit={commitRisk} />
 
@@ -334,6 +458,11 @@ export default function App() {
       <section className="panel">
         <div className="panel-head"><h2>Watchlist</h2>
           <span className="head-note">conviction −100…+100 · gate ≥ {fmt(gate, 0)} · 3-model ensemble</span></div>
+        <AddTicker
+          count={tickers.length}
+          max={wl?.max_tickers ?? 10}
+          onAdd={async (sym, name, etf) => { await addWatchlistTicker(sym, name, etf); load(); }}
+        />
         <div className="grid">
           {tickers.map((s) => {
             const up = (s.change ?? 0) >= 0;
@@ -346,6 +475,14 @@ export default function App() {
                     {s.crowding && <span className="crowd" title="Extreme one-sided retail sentiment">crowd</span>}
                     {s.stale && <span className="stale">stale</span>}
                     <Chip sig={s.signal} />
+                    <button
+                      className="tkr-rm" title={`Remove ${s.symbol} from the watchlist`}
+                      onClick={async () => {
+                        if (!confirm(`Remove ${s.symbol} from the watchlist?`)) return;
+                        try { await removeWatchlistTicker(s.symbol); load(); }
+                        catch (e) { alert(e.message); }
+                      }}
+                    >×</button>
                   </div>
                 </div>
                 <div className="card-px">
@@ -441,6 +578,32 @@ h2 { font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: $
 .stat { display: flex; flex-direction: column; }
 .stat-l { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: ${C.mut}; }
 .stat-v { font-size: 15px; }
+.stat-src { font-size: 9px; letter-spacing: .1em; text-transform: uppercase; color: ${C.mut}; margin-top: 2px; }
+.stat-src.warn { color: ${C.amber}; }
+.banner.warn { border-color: ${C.amber}55; }
+.bottom-line { display: flex; gap: 32px; align-items: flex-end; flex-wrap: wrap; padding-bottom: 16px; margin-bottom: 4px; border-bottom: 1px solid ${C.line}; }
+.bl-main { display: flex; flex-direction: column; gap: 4px; }
+.bl-eq { font-size: 30px; letter-spacing: -.01em; }
+.bl-ret { font-size: 30px; letter-spacing: -.01em; }
+.bl-side { display: grid; grid-template-columns: repeat(2, auto); gap: 4px 28px; margin-left: auto; }
+.bl-side div { display: flex; gap: 8px; justify-content: space-between; font-size: 11px; }
+.bl-side dt { color: ${C.mut}; margin: 0; }
+.bl-side dd { margin: 0; }
+.bl-note { font-size: 11px; color: ${C.mut}; margin: 10px 0 0; line-height: 1.5; }
+.add-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.add-open { font: 600 11px 'Space Grotesk'; letter-spacing: .08em; background: transparent; color: ${C.teal}; border: 1px dashed ${C.teal}88; padding: 7px 12px; border-radius: 6px; cursor: pointer; }
+.add-open:disabled { color: ${C.mut}; border-color: ${C.line}; cursor: not-allowed; }
+.add-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 14px; padding: 12px; background: ${C.panel2}; border: 1px solid ${C.line}; border-radius: 8px; }
+.add-form input, .add-form select { background: ${C.bg}; color: ${C.ink}; border: 1px solid ${C.line}; border-radius: 6px; padding: 7px 10px; font-size: 12px; font-family: inherit; }
+.add-sym { width: 100px; text-transform: uppercase; letter-spacing: .1em; }
+.add-name { flex: 1; min-width: 160px; }
+.add-go { font: 600 11px 'Space Grotesk'; letter-spacing: .08em; background: ${C.teal}; color: ${C.bg}; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; }
+.add-go:disabled { background: ${C.line}; color: ${C.mut}; cursor: not-allowed; }
+.add-cancel { font-size: 11px; background: transparent; color: ${C.mut}; border: none; cursor: pointer; }
+.add-err { flex-basis: 100%; font-size: 11px; color: ${C.coral}; }
+.add-hint { flex-basis: 100%; font-size: 10px; color: ${C.mut}; }
+.tkr-rm { background: transparent; border: none; color: ${C.mut}; font-size: 15px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.tkr-rm:hover { color: ${C.coral}; }
 .mode { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: .18em; color: ${C.amber}; border: 1px dashed ${C.amber}; padding: 5px 10px; border-radius: 4px; }
 .health { font-size: 11px; border: 1px solid; border-radius: 4px; padding: 5px 10px; }
 .kill { font: 600 11px 'Space Grotesk'; letter-spacing: .1em; text-transform: uppercase; background: transparent; color: ${C.coral}; border: 1px solid ${C.coral}; padding: 7px 12px; border-radius: 6px; cursor: pointer; }

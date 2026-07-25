@@ -16,7 +16,7 @@ from sqlalchemy import text
 from sentinel.alerts.notifier import make_notifier
 from sentinel.config import get_settings
 from sentinel.db import get_engine, session_scope
-from sentinel.execution.factory import make_broker
+from sentinel.execution.factory import make_broker_with_status
 from sentinel.execution.loop import run_cycle
 from sentinel.ingestion.prices import (
     backfill_symbols,
@@ -29,6 +29,7 @@ from sentinel.nlp.events import make_event_classifier
 from sentinel.nlp.sentiment import make_sentiment_scorer
 from sentinel.redis_client import get_redis
 from sentinel.sentiment_jobs import refresh_sentiment
+from sentinel.universe import load_universe, mark_backfilled, pending_backfill
 
 log = get_logger("sentinel.worker")
 
@@ -69,15 +70,46 @@ def _heartbeat(reason: str) -> None:
         pass
 
 
+def _sync_universe(settings, md, watchlist, symbols):
+    """Reload the universe and backfill any ticker that has no history yet.
+
+    Returns the (possibly unchanged) watchlist and ingest-symbol list. A new
+    ticker needs its full bar history before it can produce features, so the
+    backfill happens here rather than waiting for a worker restart.
+    """
+    with session_scope() as session:
+        fresh = load_universe(session, settings)
+        todo = [t.symbol for t in pending_backfill(session)]
+
+    if todo:
+        log.info("backfilling %d new ticker(s): %s", len(todo), ", ".join(todo))
+        for symbol in todo:
+            try:
+                backfill_symbols(md, [symbol], settings.backfill_years)
+            except Exception:  # noqa: BLE001 - one bad symbol must not stall the rest
+                log.exception("backfill failed for %s; will retry next cycle", symbol)
+                continue
+            with session_scope() as session:
+                mark_backfilled(session, symbol)
+
+    if fresh.symbols != watchlist.symbols:
+        log.info("watchlist changed: %s", ", ".join(fresh.symbols))
+        return fresh, settings.all_ingest_symbols(fresh)
+    return watchlist, symbols
+
+
 def run() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     log.info("worker starting in %s mode", settings.mode)
 
-    watchlist = settings.load_watchlist()
-    log.info("watchlist: %s", ", ".join(watchlist.symbols))
-
     wait_for_db()
+
+    # The universe lives in the DB (seeded from YAML on first use) so it can be
+    # edited from the UI without a restart.
+    with session_scope() as session:
+        watchlist = load_universe(session, settings)
+    log.info("watchlist: %s", ", ".join(watchlist.symbols))
 
     # Backfill source is yfinance by default (free, no keys); Alpaca is used for
     # execution. All ingest symbols = watchlist + benchmark/sector/VIX context.
@@ -90,7 +122,14 @@ def run() -> None:
         log.exception("backfill failed; continuing")
 
     model = _ensure_model(settings)  # loads, or auto-trains if data exists
-    broker = make_broker(settings)
+    broker, broker_status = make_broker_with_status(settings)
+    if broker_status.degraded:
+        # Loud, because every equity number downstream is now simulated.
+        log.warning(
+            "BROKER DEGRADED — %s. Running the paper loop on the in-memory sim; "
+            "fix the credentials and restart the worker to reconnect.",
+            broker_status.detail,
+        )
     notifier = make_notifier(settings)
 
     # FinBERT + event classifier are built once (FinBERT load is expensive).
@@ -105,6 +144,13 @@ def run() -> None:
         settings.ingest_interval_seconds,
     )
     while _running:
+        # Pick up tickers added through the API, and give each one its price
+        # history before the model is asked to score it.
+        try:
+            watchlist, symbols = _sync_universe(settings, md, watchlist, symbols)
+        except Exception:  # noqa: BLE001 - keep the loop alive
+            log.exception("universe sync failed")
+
         try:
             ingest_latest_prices(md, symbols)
         except Exception:  # noqa: BLE001 - keep the loop alive

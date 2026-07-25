@@ -21,6 +21,19 @@ async function send(path, method, body) {
   return res.json().catch(() => null);
 }
 
+// Edits need the server's rejection reason (duplicate, full, unknown symbol),
+// so unlike send() this surfaces the error body instead of swallowing it.
+async function sendOrThrow(path, method, body) {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(data?.detail || `request failed (${res.status})`);
+  return data;
+}
+
 export const fetchWatchlist = () => getJSON("/watchlist");
 export const fetchHealth = () => getJSON("/health");
 export const fetchRiskProfiles = () => getJSON("/risk/profiles");
@@ -35,6 +48,10 @@ export const setRiskFactor = (risk_factor) =>
   send("/risk/factor", "PUT", { risk_factor });
 export const killSwitch = (flatten = true) =>
   send(`/kill?flatten=${flatten}`, "POST");
+export const addWatchlistTicker = (symbol, name, sector_etf) =>
+  sendOrThrow("/watchlist/tickers", "POST", { symbol, name, sector_etf });
+export const removeWatchlistTicker = (symbol) =>
+  sendOrThrow(`/watchlist/tickers/${encodeURIComponent(symbol)}`, "DELETE");
 export const addTracker = (handle, source) =>
   send("/trackers", "POST", { handle, source });
 export const removeTracker = (source, handle) =>

@@ -13,8 +13,12 @@ from sentinel.config import Settings
 from sentinel.golive.gate import evaluate_gate
 from sentinel.golive.mode import unlock_live
 from sentinel.golive.review import record_review, review_count, sample_unreviewed
-from sentinel.models import BacktestRun, Base, Decision, EquitySnapshot
-from sentinel.system_state import ensure_dry_run_started, record_breaker_event
+from sentinel.models import BacktestRun, Base, DailyBar, Decision, EquitySnapshot
+from sentinel.system_state import (
+    ensure_dry_run_started,
+    get_state,
+    record_breaker_event,
+)
 
 
 @pytest.fixture
@@ -32,15 +36,46 @@ def db(test_database_url):
         engine.dispose()
 
 
-def _seed_equity(session, days, start_equity=100_000, growth=0.001):
+def _seed_equity(session, days, start_equity=100_000, growth=0.001, source="live"):
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     eq = start_equity
     for i in range(days):
         eq *= 1 + growth
         session.add(EquitySnapshot(
-            ts=base + timedelta(days=i), equity=eq, cash=eq, exposure_pct=0.0, mode="DRY_RUN"
+            ts=base + timedelta(days=i), equity=eq, cash=eq, exposure_pct=0.0,
+            mode="DRY_RUN", source=source,
         ))
     session.commit()
+
+
+def test_paper_return_ignores_the_replay_seam(db):
+    """Two flat series at different levels must read as 0%, not as the step."""
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for i in range(5):  # replay: flat at 99,695
+        db.add(EquitySnapshot(
+            ts=base + timedelta(days=i), equity=99_695, cash=99_695,
+            exposure_pct=0.0, mode="DRY_RUN", source="replay",
+        ))
+    for i in range(5):  # live: flat at 100,000
+        db.add(EquitySnapshot(
+            ts=base + timedelta(days=10 + i), equity=100_000, cash=100_000,
+            exposure_pct=0.0, mode="DRY_RUN", source="live",
+        ))
+    for i in range(15):  # a flat basket, so excess isolates the paper return
+        db.add(DailyBar(
+            symbol="NVDA", ts=base + timedelta(days=i), open=100, high=100,
+            low=100, close=100, volume=1_000,
+        ))
+    # get_state() starts the clock at row-creation time, so set it explicitly
+    # rather than via ensure_dry_run_started, which won't override it.
+    get_state(db).dry_run_started_at = base
+    db.commit()
+
+    gate = evaluate_gate(db, Settings(), ["NVDA"])
+    excess = next(c for c in gate.criteria if c.key == "excess_return")
+    # Neither series moves internally, so the paper return is flat. Spanning the
+    # boundary would have reported 100000/99695 - 1 = +0.31%.
+    assert "paper 0.0%" in excess.detail
 
 
 def test_gate_fails_early_then_criteria_move(db):

@@ -27,7 +27,7 @@ from sentinel.logging_config import get_logger
 from sentinel.model.technical import TechnicalModel
 from sentinel.models import EquitySnapshot
 from sentinel.news.earnings import is_in_blackout
-from sentinel.repositories import get_sentiment_cache
+from sentinel.repositories import get_latest_prices, get_sentiment_cache
 from sentinel.risk.breakers import check_breakers, validate_order
 from sentinel.risk.manager import size_position
 from sentinel.risk.profile import risk_profile
@@ -69,6 +69,31 @@ def _day_start_and_hwm(
     return day_start, high_water
 
 
+def _mark_to_market(
+    session_factory: SessionFactory, watchlist: Watchlist, broker: Broker
+) -> None:
+    """Feed the latest prices to a broker that marks its own book.
+
+    Only the sim needs this — Alpaca marks positions itself. Without it the sim
+    values every holding at its entry price forever, so equity never moves and
+    no stop or target ever triggers.
+    """
+    mark = getattr(broker, "mark", None)
+    if mark is None:
+        return
+    try:
+        with session_factory() as session:
+            prices = {
+                symbol: float(row.price)
+                for symbol, row in get_latest_prices(session, watchlist.symbols).items()
+            }
+        if prices:
+            for symbol in mark(prices):
+                log.info("sim bracket triggered, closed %s", symbol)
+    except Exception:  # noqa: BLE001 - marking is best-effort, never fail a cycle
+        log.warning("could not mark the sim to market", exc_info=True)
+
+
 def run_cycle(
     *,
     session_factory: SessionFactory,
@@ -89,6 +114,7 @@ def run_cycle(
     profile = risk_profile(risk_factor)
     gate = profile.min_conviction
 
+    _mark_to_market(session_factory, watchlist, broker)
     account = broker.get_account()
     positions = broker.get_positions()
     open_keys = set(broker.open_order_keys())

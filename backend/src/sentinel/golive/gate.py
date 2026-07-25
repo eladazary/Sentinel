@@ -59,13 +59,43 @@ class GateResult:
         }
 
 
-def _equity_series(session: Session) -> pd.Series:
-    rows = session.execute(
-        select(EquitySnapshot.ts, EquitySnapshot.equity).order_by(EquitySnapshot.ts.asc())
-    ).all()
+def _equity_series(session: Session, source: str | None = None) -> pd.Series:
+    """Equity over time, optionally restricted to one source.
+
+    Replay and live rows are two unrelated series spliced end to end: the
+    replay's final equity and the live series' opening equity have no
+    relationship, so spanning both makes `last / first - 1` a measurement of
+    that discontinuity rather than a return.
+    """
+    stmt = select(EquitySnapshot.ts, EquitySnapshot.equity)
+    if source is not None:
+        stmt = stmt.where(EquitySnapshot.source == source)
+    rows = session.execute(stmt.order_by(EquitySnapshot.ts.asc())).all()
     if not rows:
         return pd.Series(dtype=float)
     return pd.Series([float(e) for _, e in rows], index=[t for t, _ in rows])
+
+
+def _segment_returns(session: Session) -> pd.Series:
+    """Per-period returns computed *within* each source, then concatenated.
+
+    Deliberately never across the boundary. The replay keeps its own internal
+    performance (that's the point of the accelerated dry-run) without the step
+    from its closing equity to the live series' opening equity being counted as
+    a gain.
+    """
+    parts = []
+    for src in ("replay", "live"):
+        eq = _equity_series(session, src)
+        if len(eq) >= 2:
+            parts.append(eq.pct_change().dropna())
+    if not parts:
+        return pd.Series(dtype=float)
+    return pd.concat(parts).sort_index()
+
+
+def _compounded(returns: pd.Series) -> float:
+    return float((1.0 + returns).prod() - 1.0) if len(returns) else 0.0
 
 
 def _basket_return(session: Session, symbols: list[str], start: datetime) -> float | None:
@@ -102,9 +132,9 @@ def evaluate_gate(
     ))
 
     # 2. risk-adjusted excess return vs basket
-    eq = _equity_series(session)
-    paper_ret = float(eq.iloc[-1] / eq.iloc[0] - 1.0) if len(eq) >= 2 else 0.0
-    paper_sharpe = sharpe(eq.pct_change().dropna()) if len(eq) >= 3 else 0.0
+    rets = _segment_returns(session)
+    paper_ret = _compounded(rets)
+    paper_sharpe = sharpe(rets) if len(rets) >= 2 else 0.0
     basket = _basket_return(session, watchlist_symbols, start)
     excess = (paper_ret - basket) if basket is not None else None
     passed2 = excess is not None and excess > 0 and paper_sharpe > 0
@@ -117,8 +147,10 @@ def evaluate_gate(
         round(excess, 4) if excess is not None else None, 0,
     ))
 
-    # 3. drawdown within model (backtest) expectation
-    paper_dd = max_drawdown(eq) if len(eq) >= 2 else 0.0
+    # 3. drawdown within model (backtest) expectation. Measured on a curve
+    # rebuilt from the seam-free returns, not on the spliced series.
+    curve = settings.starting_equity * (1.0 + rets).cumprod()
+    paper_dd = max_drawdown(curve) if len(curve) >= 2 else 0.0
     bt = session.execute(
         select(BacktestRun).order_by(BacktestRun.created_at.desc()).limit(1)
     ).scalar_one_or_none()

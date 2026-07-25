@@ -4,13 +4,20 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from sentinel.api.deps import get_db, settings_dep, watchlist_dep
 from sentinel.config import Settings, Watchlist
 from sentinel.repositories import build_watchlist_rows
 from sentinel.schemas import WatchlistResponse, WatchlistTicker
+from sentinel.universe import (
+    MAX_TICKERS,
+    UniverseError,
+    add_ticker,
+    load_universe,
+    remove_ticker,
+)
 
 router = APIRouter(tags=["market"])
 
@@ -27,12 +34,53 @@ def _is_stale(as_of: datetime | None, now: datetime) -> bool:
     return (now - as_of) > _STALE_AFTER
 
 
+@router.post("/watchlist/tickers", response_model=WatchlistResponse)
+def add_watchlist_ticker(
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(settings_dep),
+    symbol: str = Body(embed=True),
+    name: str = Body(default="", embed=True),
+    sector_etf: str | None = Body(default=None, embed=True),
+) -> WatchlistResponse:
+    """Add a ticker. It trades once the worker has backfilled its history."""
+    load_universe(db, settings)  # ensure the table is seeded before counting
+    try:
+        add_ticker(db, symbol, name, sector_etf)
+    except UniverseError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return _render(db, settings)
+
+
+@router.delete("/watchlist/tickers/{symbol}", response_model=WatchlistResponse)
+def remove_watchlist_ticker(
+    symbol: str,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(settings_dep),
+) -> WatchlistResponse:
+    load_universe(db, settings)
+    try:
+        if not remove_ticker(db, symbol):
+            raise HTTPException(status_code=404, detail=f"{symbol} is not in the watchlist")
+    except UniverseError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+    return _render(db, settings)
+
+
 @router.get("/watchlist", response_model=WatchlistResponse)
 def watchlist(
     db: Session = Depends(get_db),
     wl: Watchlist = Depends(watchlist_dep),
     settings: Settings = Depends(settings_dep),
 ) -> WatchlistResponse:
+    return _render(db, settings, wl)
+
+
+def _render(
+    db: Session, settings: Settings, wl: Watchlist | None = None
+) -> WatchlistResponse:
+    wl = wl or load_universe(db, settings)
     now = datetime.now(timezone.utc)
     tickers = [(t.symbol, t.name) for t in wl.tickers]
     rows = build_watchlist_rows(db, tickers)
@@ -58,4 +106,6 @@ def watchlist(
         )
         for r in rows
     ]
-    return WatchlistResponse(mode=settings.mode, count=len(payload), tickers=payload)
+    return WatchlistResponse(
+        mode=settings.mode, count=len(payload), tickers=payload, max_tickers=MAX_TICKERS
+    )

@@ -48,7 +48,7 @@ def simulate_dryrun(
         dlog.record_equity(
             session, ts=_utc(ts), equity=float(equity),
             cash=float(equity) * (1 - exposure), exposure_pct=exposure * 100.0,
-            mode="DRY_RUN",
+            mode="DRY_RUN", source="replay",
         )
 
     # 2. decision log from in-window trades.

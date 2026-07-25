@@ -13,11 +13,76 @@ import pytest
 
 from sentinel.config import Settings, Ticker, Watchlist
 from sentinel.execution import loop as loop_mod
+from sentinel.execution.factory import (
+    BrokerUnavailable,
+    make_broker_with_status,
+    reset_broker_cache,
+)
 from sentinel.execution.scheduler import in_entry_window, is_market_open
 from sentinel.execution.sim_broker import SimBroker
 from sentinel.features.engineering import FEATURE_COLUMNS
 
 ET = ZoneInfo("America/New_York")
+
+
+# ---- broker factory ----
+
+@pytest.fixture(autouse=True)
+def _clean_broker_cache():
+    reset_broker_cache()
+    yield
+    reset_broker_cache()
+
+
+@pytest.fixture
+def rejected_alpaca(monkeypatch):
+    """Credentials that are present but answered with a 401."""
+    import sentinel.execution.alpaca_broker as alpaca_mod
+
+    class _Rejecting:
+        def __init__(self, *a, **kw):
+            pass
+
+        def get_account(self):
+            raise RuntimeError("401 Client Error: Unauthorized for url: /v2/account")
+
+    monkeypatch.setattr(alpaca_mod, "AlpacaBroker", _Rejecting)
+
+
+def _creds(**kw):
+    return Settings(alpaca_api_key="PKTEST", alpaca_secret_key="secret", **kw)
+
+
+def _no_creds(**kw):
+    # Explicit, so a stray SENTINEL_ALPACA_* in the environment can't turn these
+    # into live network calls.
+    return Settings(alpaca_api_key=None, alpaca_secret_key=None, **kw)
+
+
+def test_dry_run_degrades_to_sim_on_bad_credentials(rejected_alpaca):
+    broker, status = make_broker_with_status(_creds(mode="DRY_RUN"))
+    assert isinstance(broker, SimBroker)
+    assert status.broker == "sim" and status.degraded
+    assert "401" in status.detail
+
+
+def test_live_refuses_to_simulate_on_bad_credentials(rejected_alpaca):
+    with pytest.raises(BrokerUnavailable):
+        make_broker_with_status(_creds(mode="LIVE"))
+
+
+def test_live_refuses_without_credentials():
+    with pytest.raises(BrokerUnavailable):
+        make_broker_with_status(_no_creds(mode="LIVE"))
+
+
+def test_sim_is_reused_so_positions_survive():
+    s = _no_creds(mode="DRY_RUN")
+    first, _ = make_broker_with_status(s)
+    first.submit_bracket("AAA", 10, 100.0, 95.0, 110.0)
+    second, _ = make_broker_with_status(s)
+    assert second is first
+    assert "AAA" in second.get_positions()
 
 
 # ---- sim broker ----
@@ -96,6 +161,7 @@ def patched_loop(monkeypatch):
     )
     monkeypatch.setattr(loop_mod, "_day_start_and_hwm", lambda s, n, e: (e, e))
     monkeypatch.setattr(loop_mod, "get_sentiment_cache", lambda s, syms: {})
+    monkeypatch.setattr(loop_mod, "get_latest_prices", lambda s, syms: {})
     monkeypatch.setattr(loop_mod, "is_in_blackout", lambda s, sym, n, h: False)
     monkeypatch.setattr(loop_mod, "ensure_dry_run_started", lambda s, n=None: None)
     monkeypatch.setattr(loop_mod, "record_breaker_event", lambda s, **kw: None)
@@ -137,6 +203,22 @@ def test_loop_skips_below_gate(patched_loop):
     )
     assert any(a["action"] == "SKIP" for a in report.actions)
     assert "AAA" not in broker.get_positions()
+
+
+def test_loop_marks_sim_to_market(patched_loop, monkeypatch):
+    """A cycle must mark the sim, or equity freezes at the entry price forever."""
+    broker = SimBroker(cash=100_000)
+    broker.submit_bracket("AAA", 100, 100.0, 95.0, 110.0)
+    monkeypatch.setattr(
+        loop_mod, "get_latest_prices",
+        lambda s, syms: {"AAA": SimpleNamespace(price=94.0)},  # below the stop
+    )
+    loop_mod.run_cycle(
+        session_factory=_fake_session, settings=_settings(), watchlist=_watchlist(),
+        broker=broker, model=FakeModel(0.20), enforce_entry_window=False,
+    )
+    assert "AAA" not in broker.get_positions()  # stop triggered on the mark
+    assert broker.get_account().equity == pytest.approx(99_400, abs=1)
 
 
 def test_loop_breaker_flattens(patched_loop, monkeypatch):

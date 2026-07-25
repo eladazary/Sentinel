@@ -41,7 +41,10 @@ def test_health_ok(client, monkeypatch):
     assert body["status"] == "ok"
     assert body["mode"] in {"DRY_RUN", "LIVE"}
     names = {c["name"]: c["ok"] for c in body["components"]}
-    assert names == {"database": True, "redis": True}
+    assert names["database"] is True
+    assert names["redis"] is True
+    # The broker is reported for visibility but must not gate liveness.
+    assert any(n.startswith("broker") for n in names)
 
 
 def test_health_degraded_returns_503(client, monkeypatch):
@@ -59,6 +62,24 @@ def test_health_degraded_returns_503(client, monkeypatch):
     comps = {c["name"]: c["ok"] for c in body["components"]}
     assert comps["database"] is False
     assert comps["redis"] is False
+
+
+def test_degraded_broker_does_not_fail_health(client, monkeypatch):
+    """A rejected key must not take the API container down with it."""
+    from sentinel.execution.factory import BrokerStatus
+
+    monkeypatch.setattr(health_mod, "get_engine", lambda: _FakeEngine())
+    monkeypatch.setattr(health_mod, "redis_ping", lambda: True)
+    monkeypatch.setattr(
+        "sentinel.execution.factory.make_broker_with_status",
+        lambda s: (None, BrokerStatus("sim", degraded=True, detail="HTTP 401")),
+    )
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    broker = next(c for c in body["components"] if c["name"].startswith("broker"))
+    assert broker["ok"] is False and broker["detail"] == "HTTP 401"
 
 
 # ---- watchlist ----

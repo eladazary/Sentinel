@@ -30,11 +30,29 @@ def _check_redis() -> HealthComponent:
     )
 
 
+def _check_broker() -> HealthComponent:
+    """Report the broker without gating liveness.
+
+    A rejected API key is worth seeing here, but it must not turn the container
+    unhealthy — DRY_RUN carries on against the sim, and flipping to 503 would
+    take the API down and block the worker's service_healthy dependency.
+    """
+    from sentinel.execution.factory import BrokerUnavailable, make_broker_with_status
+
+    try:
+        _, status = make_broker_with_status(get_settings())
+    except BrokerUnavailable as exc:
+        return HealthComponent(name="broker", ok=False, detail=str(exc))
+    return HealthComponent(
+        name=f"broker:{status.broker}", ok=not status.degraded, detail=status.detail
+    )
+
+
 @router.get("/health", response_model=HealthResponse)
 def health(response: Response) -> HealthResponse:
     settings = get_settings()
-    components = [_check_db(), _check_redis()]
-    all_ok = all(c.ok for c in components)
+    gating = [_check_db(), _check_redis()]
+    all_ok = all(c.ok for c in gating)
     if not all_ok:
         # 503 so orchestrators/monitors can react, but the body still details why.
         response.status_code = 503
@@ -42,5 +60,5 @@ def health(response: Response) -> HealthResponse:
         status="ok" if all_ok else "degraded",
         mode=settings.mode,
         version=__version__,
-        components=components,
+        components=[*gating, _check_broker()],
     )

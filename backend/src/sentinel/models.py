@@ -117,6 +117,11 @@ class EquitySnapshot(Base):
     cash: Mapped[float] = mapped_column(Numeric(18, 4), nullable=False)
     exposure_pct: Mapped[float] = mapped_column(Float, nullable=False)
     mode: Mapped[str] = mapped_column(String(8), nullable=False)
+    # "live" = written by the trading loop; "replay" = accelerated historical
+    # backfill. Never mix the two in one return calculation.
+    source: Mapped[str] = mapped_column(
+        String(8), nullable=False, server_default="live"
+    )
 
 
 class NewsItemRow(Base):
@@ -154,6 +159,25 @@ class SentimentCache(Base):
     social_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     social_crowding: Mapped[bool] = mapped_column(default=False)
     social_drivers: Mapped[Any] = mapped_column(JSON, nullable=False, default=list)
+
+
+class WatchlistTicker(Base):
+    """The tradeable universe, editable at runtime.
+
+    Seeded once from config/watchlist.yaml, then authoritative. ``backfilled``
+    tracks whether the worker has pulled this symbol's price history yet — a
+    ticker can't produce features (or trade) until it has.
+    """
+
+    __tablename__ = "watchlist_tickers"
+
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    sector_etf: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    backfilled: Mapped[bool] = mapped_column(default=False)
 
 
 class TrackedAccount(Base):

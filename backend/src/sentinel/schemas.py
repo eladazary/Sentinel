@@ -45,6 +45,7 @@ class WatchlistResponse(BaseModel):
     mode: str
     count: int
     tickers: list[WatchlistTicker]
+    max_tickers: int | None = None
 
 
 class RiskProfileOut(BaseModel):
@@ -104,6 +105,12 @@ class AccountResponse(BaseModel):
     exposure_pct: float | None = None
     positions: list[PositionOut] = []
     detail: str | None = None
+    # Where the numbers came from: the broker itself, or the equity ledger the
+    # worker writes each cycle. "none" means neither could be read.
+    source: str = "broker"
+    broker: str | None = None
+    degraded: bool = False
+    as_of: datetime | None = None
 
 
 class NewsOut(BaseModel):
@@ -138,9 +145,31 @@ class PerformancePoint(BaseModel):
     spy: float | None
 
 
+class PerformanceSummary(BaseModel):
+    """The bottom line: what the money is now and what it earned.
+
+    Everything here describes the *forward* paper run only. The accelerated
+    historical replay is reported separately as ``replay_return_pct`` and is
+    never folded into the headline yield — it's a backtest, not money.
+    """
+
+    equity: float
+    starting_equity: float
+    pnl: float
+    return_pct: float
+    max_drawdown_pct: float
+    benchmark_return_pct: float | None = None
+    replay_return_pct: float | None = None
+    positions_opened: int
+    as_of: datetime | None = None
+    # Set when nothing has traded, so the UI can explain a flat 0.00%.
+    note: str | None = None
+
+
 class PerformanceResponse(BaseModel):
     starting_equity: float
     points: list[PerformancePoint]
+    summary: PerformanceSummary | None = None
 
 
 class CriterionOut(BaseModel):

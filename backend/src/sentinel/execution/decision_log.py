@@ -99,9 +99,11 @@ def record_equity(
     cash: float,
     exposure_pct: float,
     mode: str,
+    source: str = "live",
 ) -> None:
     stmt = insert(EquitySnapshot).values(
-        ts=ts, equity=equity, cash=cash, exposure_pct=exposure_pct, mode=mode
+        ts=ts, equity=equity, cash=cash, exposure_pct=exposure_pct, mode=mode,
+        source=source,
     )
     # One snapshot per timestamp; ignore duplicates within the same cycle.
     stmt = stmt.on_conflict_do_nothing(index_elements=[EquitySnapshot.ts])
