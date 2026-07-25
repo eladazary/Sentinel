@@ -37,7 +37,13 @@ SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 
 def build_news_sources(settings: Settings) -> list[NewsSource]:
-    return [EdgarSource(settings.sec_user_agent), FinnhubSource(settings.finnhub_api_key)]
+    return [
+        EdgarSource(
+            settings.sec_user_agent,
+            contact_ok=settings.has_valid_sec_user_agent,
+        ),
+        FinnhubSource(settings.finnhub_api_key),
+    ]
 
 
 def build_social_sources(settings: Settings) -> list[SocialSource]:
@@ -55,20 +61,34 @@ def _persist_news(session: Session, items) -> None:
 
 
 def _upsert_cache(session: Session, symbol: str, news, social, now: datetime) -> None:
-    stmt = insert(SentimentCache).values(
-        symbol=symbol, updated_at=now,
-        news_score=news.score, news_confidence=news.confidence, news_drivers=news.drivers,
-        social_score=social.score, social_confidence=social.confidence,
-        social_crowding=social.crowding, social_drivers=social.drivers,
-    ).on_conflict_do_update(
-        index_elements=[SentimentCache.symbol],
-        set_={
-            "updated_at": now,
-            "news_score": news.score, "news_confidence": news.confidence,
-            "news_drivers": news.drivers, "social_score": social.score,
-            "social_confidence": social.confidence, "social_crowding": social.crowding,
-            "social_drivers": social.drivers,
-        },
+    """Persist sub-model scores, writing NULL where there was nothing to score.
+
+    The aggregates return 0.0 for an empty input set, which the ensemble cannot
+    distinguish from a genuine "balanced, therefore neutral" reading — it blends
+    the 0.0 in at full weight and drags conviction toward zero. A source that is
+    down or silent must be *absent* from the ensemble, not a confident neutral
+    vote, so no-data is stored as NULL and skipped by the fusion step.
+
+    A count of zero is the honest marker. Items that exist but score neutral are
+    left as 0.0: that genuinely is information.
+    """
+    news_score = news.score if news.n_items else None
+    news_conf = news.confidence if news.n_items else None
+    social_score = social.score if social.n_posts else None
+    social_conf = social.confidence if social.n_posts else None
+
+    values = {
+        "updated_at": now,
+        "news_score": news_score,
+        "news_confidence": news_conf,
+        "news_drivers": news.drivers,
+        "social_score": social_score,
+        "social_confidence": social_conf,
+        "social_crowding": social.crowding,
+        "social_drivers": social.drivers,
+    }
+    stmt = insert(SentimentCache).values(symbol=symbol, **values).on_conflict_do_update(
+        index_elements=[SentimentCache.symbol], set_=values
     )
     session.execute(stmt)
 
