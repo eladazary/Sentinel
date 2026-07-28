@@ -7,6 +7,7 @@ flow is testable independently of the network and of TimescaleDB.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone
@@ -153,28 +154,76 @@ def make_market_data(settings) -> MarketData:
     return YFinanceMarketData()
 
 
+# Providers that return an actual last trade. Anything outside this set reports
+# delayed or daily-close data and must not be used to price an entry.
+REALTIME_QUOTE_SOURCES = frozenset({"alpaca"})
+
+_QUOTE_PROBE_TTL_SECONDS = 300.0
+_quote_probe: tuple[float, str | None] | None = None
+
+
+def reset_quote_probe() -> None:
+    """Forget the cached quote-feed verdict (tests, config changes)."""
+    global _quote_probe
+    _quote_probe = None
+
+
+def _probe_quotes(md: MarketData, symbol: str) -> str | None:
+    """Return None if the feed answers, else a short failure description."""
+    global _quote_probe
+    now = time.monotonic()
+    if _quote_probe is not None and now - _quote_probe[0] < _QUOTE_PROBE_TTL_SECONDS:
+        return _quote_probe[1]
+    try:
+        md.get_latest_prices([symbol])
+        err = None
+    except Exception as exc:  # noqa: BLE001 - any failure means "don't trust it"
+        text = str(exc)
+        if "401" in text or "unauthorized" in text.lower():
+            err = "Alpaca rejected the API credentials (HTTP 401)"
+        elif "403" in text or "forbidden" in text.lower():
+            err = "Alpaca refused the request (HTTP 403)"
+        else:
+            err = text
+    _quote_probe = (now, err)
+    return err
+
+
 def make_quote_source(settings) -> tuple[MarketData, str]:
     """Pick a provider for *live quotes*, and name it. Returns (provider, name).
 
     Deliberately separate from backfill. yfinance's ``get_latest_prices`` returns
-    the most recent daily *close*, so using it here means every order is priced
-    off yesterday's number — it cannot fill in a market that has moved, and the
-    entry staleness guard rejects it. Alpaca returns the latest trade, and it is
+    the most recent daily *close*, so it cannot price an order: the limit lands on
+    yesterday's number and never fills. Alpaca returns the latest trade, and it is
     the venue the order goes to, so its quote is the right reference.
+
+    The feed is probed before use. Credentials that are present but rejected used
+    to fail on every batched call and write nothing at all, so every symbol showed
+    up as "no quote" with no explanation anywhere near the cause.
     """
     resolved = settings.quote_source
     if resolved == "auto":
         resolved = "alpaca" if settings.has_alpaca_credentials else "yfinance"
+
     if resolved == "alpaca":
         if not settings.has_alpaca_credentials:
             raise ValueError("quote_source=alpaca but Alpaca credentials are unset")
-        return _alpaca_market_data(settings), "alpaca"
+        md = _alpaca_market_data(settings)
+        err = _probe_quotes(md, settings.benchmark_symbol)
+        if err is None:
+            return md, "alpaca"
+        log.error(
+            "QUOTE FEED UNUSABLE — %s. Falling back to yfinance so the dashboard "
+            "still has prices, but entries will be REFUSED: that feed reports "
+            "daily closes, not live trades. Fix the credentials to trade.",
+            err,
+        )
+    else:
+        log.warning(
+            "quotes are coming from yfinance, which reports the last daily CLOSE. "
+            "Entries will be refused; configure Alpaca credentials to trade."
+        )
 
-    log.warning(
-        "quotes are coming from yfinance, which reports the last daily CLOSE — "
-        "entries will be priced off stale data and are likely to be rejected by "
-        "the freshness guard. Configure Alpaca credentials for live quotes."
-    )
     from sentinel.ingestion.yfinance_source import YFinanceMarketData
 
     return YFinanceMarketData(), "yfinance"

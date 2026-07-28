@@ -152,10 +152,25 @@ def test_ingest_latest_prices_empty(monkeypatch):
 
 # ---- quote source is separate from backfill ----
 
-def test_auto_quote_source_prefers_alpaca_when_credentials_exist():
+def _stub_working_alpaca(monkeypatch):
+    """A quote feed that answers. Stubbed so the test never hits the network —
+    with real credentials absent, a live probe would 401 and degrade."""
+    from datetime import datetime, timezone
+
+    from sentinel.ingestion import prices as prices_mod
+
+    class _Working:
+        def get_latest_prices(self, symbols):
+            return {s: (1.0, datetime.now(timezone.utc)) for s in symbols}
+
+    monkeypatch.setattr(prices_mod, "_alpaca_market_data", lambda s: _Working())
+
+
+def test_auto_quote_source_prefers_alpaca_when_credentials_work(monkeypatch):
     from sentinel.config import Settings
     from sentinel.ingestion.prices import make_quote_source
 
+    _stub_working_alpaca(monkeypatch)
     s = Settings(alpaca_api_key="PKTEST", alpaca_secret_key="secret")
     _, name = make_quote_source(s)
     assert name == "alpaca"
@@ -170,11 +185,12 @@ def test_auto_quote_source_falls_back_to_yfinance_without_credentials():
     assert name == "yfinance"
 
 
-def test_quote_source_is_independent_of_backfill_source():
+def test_quote_source_is_independent_of_backfill_source(monkeypatch):
     """Backfill on yfinance must not drag quotes onto daily closes with it."""
     from sentinel.config import Settings
     from sentinel.ingestion.prices import make_quote_source
 
+    _stub_working_alpaca(monkeypatch)
     s = Settings(
         backfill_source="yfinance",
         alpaca_api_key="PKTEST",
@@ -220,3 +236,83 @@ def test_ingest_records_the_provider_that_served_the_quote(monkeypatch):
         md, ["AAA"], session_factory=fake_session, source="yfinance"
     )
     assert captured == ["yfinance"]
+
+
+# ---- quote feed probing: rejected credentials must not fail silently ----
+
+@pytest.fixture(autouse=True)
+def _clean_quote_probe():
+    from sentinel.ingestion.prices import reset_quote_probe
+    reset_quote_probe()
+    yield
+    reset_quote_probe()
+
+
+def test_rejected_alpaca_quotes_degrade_to_yfinance(monkeypatch):
+    """Present-but-rejected keys used to 401 every batched call and write nothing,
+    so every symbol showed up as "no quote" with the cause nowhere in sight."""
+    from sentinel.config import Settings
+    from sentinel.ingestion import prices as prices_mod
+
+    class _Rejecting:
+        def get_latest_prices(self, symbols):
+            raise RuntimeError("401 Client Error: Unauthorized")
+
+    monkeypatch.setattr(prices_mod, "_alpaca_market_data", lambda s: _Rejecting())
+    s = Settings(alpaca_api_key="PKTEST", alpaca_secret_key="secret")
+    _, name = prices_mod.make_quote_source(s)
+    assert name == "yfinance"
+
+
+def test_working_alpaca_quotes_are_used(monkeypatch):
+    from datetime import datetime, timezone
+
+    from sentinel.config import Settings
+    from sentinel.ingestion import prices as prices_mod
+
+    class _Working:
+        def get_latest_prices(self, symbols):
+            return {s: (1.0, datetime.now(timezone.utc)) for s in symbols}
+
+    monkeypatch.setattr(prices_mod, "_alpaca_market_data", lambda s: _Working())
+    s = Settings(alpaca_api_key="PKTEST", alpaca_secret_key="secret")
+    _, name = prices_mod.make_quote_source(s)
+    assert name == "alpaca"
+
+
+def test_probe_is_cached_so_it_is_not_run_per_cycle(monkeypatch):
+    from datetime import datetime, timezone
+
+    from sentinel.config import Settings
+    from sentinel.ingestion import prices as prices_mod
+
+    calls = []
+
+    class _Counting:
+        def get_latest_prices(self, symbols):
+            calls.append(1)
+            return {s: (1.0, datetime.now(timezone.utc)) for s in symbols}
+
+    monkeypatch.setattr(prices_mod, "_alpaca_market_data", lambda s: _Counting())
+    s = Settings(alpaca_api_key="PKTEST", alpaca_secret_key="secret")
+    prices_mod.make_quote_source(s)
+    prices_mod.make_quote_source(s)
+    assert len(calls) == 1
+
+
+def test_delayed_feed_cannot_price_an_entry():
+    """The freshness guard measures *our fetch time*, so a yfinance daily close
+    pulled a second ago looks fresh while being a day stale."""
+    from sentinel.execution.loop import Quote
+
+    live = Quote(price=100.0, age_seconds=5.0, source="alpaca")
+    assert live.usable_for_entry(300.0) is None
+
+    delayed = Quote(price=100.0, age_seconds=5.0, source="yfinance")
+    assert "delayed closes" in delayed.usable_for_entry(300.0)
+
+    stale = Quote(price=100.0, age_seconds=9999.0, source="alpaca")
+    assert "old" in stale.usable_for_entry(300.0)
+
+    unknown = Quote(price=100.0, age_seconds=1.0)
+    assert unknown.usable_for_entry(300.0) is not None

@@ -151,11 +151,16 @@ def _feature_frame():
     return pd.DataFrame(data, index=idx)
 
 
-def _quote(price, age_seconds=0.0):
-    """A LatestPrice-shaped row. Entries now require a *fresh* quote."""
+def _quote(price, age_seconds=0.0, source="alpaca"):
+    """A LatestPrice-shaped row.
+
+    Entries require a quote that is both fresh and from a real-time feed, so the
+    source matters as much as the age.
+    """
     return SimpleNamespace(
         price=price,
         updated_at=datetime.now(timezone.utc) - timedelta(seconds=age_seconds),
+        source=source,
     )
 
 
@@ -328,7 +333,7 @@ def test_entry_is_refused_on_a_stale_quote(patched_loop, monkeypatch):
         broker=broker, model=FakeModel(0.95), enforce_entry_window=False,
     )
     assert "AAA" not in broker.get_positions()
-    assert any(a["reason"] == "stale quote" for a in report.actions)
+    assert any(a["reason"] == "unusable quote" for a in report.actions)
 
 
 def test_unfillable_resting_buy_is_cancelled_not_left_to_block(monkeypatch):
@@ -353,7 +358,7 @@ def test_unfillable_resting_buy_is_cancelled_not_left_to_block(monkeypatch):
 
     freed = loop_mod._cancel_unfillable_buys(
         StuckBroker(cash=100_000),
-        {"AAA": loop_mod.Quote(price=130.0, age_seconds=1.0)},  # market ran away
+        {"AAA": loop_mod.Quote(price=130.0, age_seconds=1.0, source="alpaca")},  # market ran away
         _settings(),
     )
     assert cancelled == ["o1"]
@@ -378,7 +383,7 @@ def test_a_still_viable_resting_buy_is_left_alone():
 
     freed = loop_mod._cancel_unfillable_buys(
         Broker(cash=100_000),
-        {"AAA": loop_mod.Quote(price=130.0, age_seconds=1.0)},
+        {"AAA": loop_mod.Quote(price=130.0, age_seconds=1.0, source="alpaca")},
         _settings(),
     )
     assert cancelled == [] and freed == set()

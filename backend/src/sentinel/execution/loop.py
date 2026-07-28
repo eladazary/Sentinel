@@ -27,6 +27,7 @@ from sentinel.logging_config import get_logger
 from sentinel.model.technical import TechnicalModel
 from sentinel.models import EquitySnapshot
 from sentinel.news.earnings import is_in_blackout
+from sentinel.ingestion.prices import REALTIME_QUOTE_SOURCES
 from sentinel.repositories import get_latest_prices, get_sentiment_cache
 from sentinel.risk.breakers import check_breakers, validate_order
 from sentinel.risk.manager import size_position
@@ -71,13 +72,33 @@ def _day_start_and_hwm(
 
 @dataclass(frozen=True)
 class Quote:
-    """A live price plus how old our observation of it is."""
+    """A price, how old our observation of it is, and which feed served it."""
 
     price: float
     age_seconds: float
+    source: str = ""
 
     def fresh(self, max_age: float) -> bool:
         return self.age_seconds <= max_age
+
+    @property
+    def realtime(self) -> bool:
+        """Whether this feed reports actual trades.
+
+        Age alone is not enough. Freshness is measured from when *we* fetched the
+        quote, so a yfinance daily close pulled a second ago looks perfectly
+        fresh while being a day stale — which is the exact mispricing the entry
+        guard exists to prevent.
+        """
+        return self.source in REALTIME_QUOTE_SOURCES
+
+    def usable_for_entry(self, max_age: float) -> str | None:
+        """None if this quote can price an order, else why it can't."""
+        if not self.realtime:
+            return f"quote feed '{self.source or 'unknown'}' reports delayed closes, not live trades"
+        if not self.fresh(max_age):
+            return f"quote is {self.age_seconds:.0f}s old (max {max_age:.0f}s)"
+        return None
 
 
 def _live_quotes(
@@ -104,7 +125,11 @@ def _live_quotes(
         if seen is not None and seen.tzinfo is None:
             seen = seen.replace(tzinfo=timezone.utc)
         age = (now - seen).total_seconds() if seen is not None else float("inf")
-        out[symbol] = Quote(price=float(row.price), age_seconds=age)
+        out[symbol] = Quote(
+            price=float(row.price),
+            age_seconds=age,
+            source=getattr(row, "source", "") or "",
+        )
     return out
 
 
@@ -150,7 +175,9 @@ def _cancel_unfillable_buys(
         if o.side != "buy" or o.limit_price is None:
             continue
         q = quotes.get(o.symbol)
-        if q is None or not q.fresh(settings.entry_max_quote_age_seconds):
+        # Only act on a feed good enough to have priced the order in the first
+        # place; a delayed close could cancel a perfectly viable limit.
+        if q is None or q.usable_for_entry(settings.entry_max_quote_age_seconds):
             continue
         if o.limit_price >= q.price:
             continue  # still at or above the market, leave it working
@@ -380,14 +407,18 @@ def run_cycle(
             # rather than guess: a limit built on a stale reference either misses
             # the market entirely or overpays into a gap.
             max_age = settings.entry_max_quote_age_seconds
-            if quote is None or not quote.fresh(max_age):
-                age = "no quote" if quote is None else f"{quote.age_seconds:.0f}s old"
+            unusable = (
+                "no quote recorded for this symbol"
+                if quote is None
+                else quote.usable_for_entry(max_age)
+            )
+            if unusable is not None:
                 dlog.log_decision(
                     session, ts=now, symbol=symbol, action="SKIP", signal=signal,
-                    reason=f"no fresh quote to price the entry ({age}, max {max_age:.0f}s)",
+                    reason=f"cannot price the entry: {unusable}",
                     **common,
                 )
-                report.add(symbol, "SKIP", "stale quote")
+                report.add(symbol, "SKIP", "unusable quote")
                 continue
             exec_price = quote.price
 
