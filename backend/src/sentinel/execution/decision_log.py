@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -115,6 +115,34 @@ def get_latest_signals(session: Session) -> dict[str, SignalSnapshot]:
     return {r.symbol: r for r in rows}
 
 
-def recent_decisions(session: Session, limit: int = 50) -> list[Decision]:
-    stmt = select(Decision).order_by(Decision.ts.desc(), Decision.id.desc()).limit(limit)
+def recent_decisions(
+    session: Session,
+    limit: int = 50,
+    *,
+    actions: list[str] | None = None,
+    symbol: str | None = None,
+    exclude_skips: bool = False,
+) -> list[Decision]:
+    """Recent decisions, newest first, with optional filters.
+
+    The log records every evaluation including skips, so on a 7-name watchlist it
+    grows by ~7 rows a minute and the handful of rows that moved money get buried.
+    ``exclude_skips`` is the common case: show what was actually done.
+    """
+    stmt = select(Decision)
+    if actions:
+        stmt = stmt.where(Decision.action.in_([a.strip().upper() for a in actions]))
+    if exclude_skips:
+        stmt = stmt.where(Decision.action != "SKIP")
+    if symbol:
+        stmt = stmt.where(Decision.symbol == symbol.strip().upper())
+    stmt = stmt.order_by(Decision.ts.desc(), Decision.id.desc()).limit(limit)
     return list(session.execute(stmt).scalars())
+
+
+def decision_action_counts(session: Session) -> dict[str, int]:
+    """How many rows per action — lets the UI label filters with counts."""
+    rows = session.execute(
+        select(Decision.action, func.count()).group_by(Decision.action)
+    ).all()
+    return {action: int(n) for action, n in rows}

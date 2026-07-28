@@ -43,6 +43,14 @@ export const fetchLatestBacktest = () => getJSON("/backtest/latest");
 export const fetchNews = (limit = 30) => getJSON(`/news?limit=${limit}`);
 export const fetchTrackers = () => getJSON("/trackers");
 export const fetchPerformance = () => getJSON("/performance");
+export const fetchPositions = () => getJSON("/positions");
+export const fetchDecisionCounts = () => getJSON("/decisions/counts");
+export const fetchDecisionsFiltered = ({ limit = 60, excludeSkips = false, symbol = null } = {}) => {
+  const q = new URLSearchParams({ limit: String(limit) });
+  if (excludeSkips) q.set("exclude_skips", "true");
+  if (symbol) q.set("symbol", symbol);
+  return getJSON(`/decisions?${q}`);
+};
 
 export const setRiskFactor = (risk_factor) =>
   send("/risk/factor", "PUT", { risk_factor });

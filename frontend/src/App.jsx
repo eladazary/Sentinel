@@ -4,6 +4,7 @@ import {
   fetchLatestBacktest, fetchNews, fetchTrackers, fetchPerformance,
   setRiskFactor, killSwitch, addTracker, removeTracker,
   addWatchlistTicker, removeWatchlistTicker,
+  fetchPositions, fetchDecisionCounts, fetchDecisionsFiltered,
   fetchGolive, fetchMode, fetchBreakers, sampleDecisions, reviewDecision,
   ackBreaker, unlockLive,
 } from "./api.js";
@@ -349,6 +350,93 @@ function GoLivePanel({ gate, mode, breakers, onReview, onAck, onUnlock }) {
   );
 }
 
+function PositionsPanel({ pos }) {
+  const held = pos?.positions || [];
+  const pending = pos?.pending || [];
+  const nothing = held.length === 0 && pending.length === 0;
+
+  return (
+    <section className="panel">
+      <div className="panel-head"><h2>Positions</h2>
+        <span className="head-note">
+          {pos?.available === false ? "broker unavailable"
+            : `${held.length} held · ${pending.length} unfilled`}
+        </span></div>
+
+      {pos?.available === false && <p className="empty">{pos.detail}</p>}
+
+      {nothing && pos?.available !== false && (
+        <p className="empty">
+          Nothing held and no orders working — the desk is flat.
+        </p>
+      )}
+
+      {held.length > 0 && (
+        <>
+          <div className="pos-tot">
+            <span>Market value <b className="mono">{fmtMoney(pos.total_market_value)}</b></span>
+            <span>Unrealized{" "}
+              <b className="mono" style={{ color: pos.total_unrealized_pnl >= 0 ? C.teal : C.coral }}>
+                {pos.total_unrealized_pnl >= 0 ? "+" : "−"}{fmtMoney(Math.abs(pos.total_unrealized_pnl)).slice(1)}
+              </b></span>
+          </div>
+          {held.map((p) => {
+            const up = (p.unrealized_pnl ?? 0) >= 0;
+            return (
+              <article key={p.symbol} className="pos-row">
+                <div className="pos-head">
+                  <span className="tkr sm">{p.symbol}</span>
+                  <span className="tkr-name">{p.name}</span>
+                  <span className="mono pos-qty">{p.qty} sh @ {fmt(p.avg_entry)}</span>
+                  <span className="mono pos-pnl" style={{ color: up ? C.teal : C.coral }}>
+                    {up ? "+" : "−"}{fmt(Math.abs(p.unrealized_pnl ?? 0), 2)}
+                    {p.unrealized_pnl_pct != null && ` (${fmtPct(p.unrealized_pnl_pct, 2)})`}
+                  </span>
+                  <Chip sig={p.current_signal} />
+                </div>
+                <div className="pos-why">
+                  <div><dt>Bought because</dt><dd>{p.entry_reason || "—"}
+                    {p.entry_conviction != null && <span className="conf"> · conv {Math.round(p.entry_conviction)}</span>}</dd></div>
+                  <div><dt>Holding because</dt><dd>
+                    {p.current_signal === "HOLD" ? "conviction still above the exit threshold"
+                      : p.current_signal === "TRIM" || p.current_signal === "SELL" ? "flagged to exit on the next cycle"
+                      : "—"}
+                    {p.current_conviction != null && <span className="conf"> · conv now {Math.round(p.current_conviction)}</span>}
+                  </dd></div>
+                  {(p.stop_price != null || p.take_profit != null) && (
+                    <div><dt>Bracket</dt><dd className="mono">
+                      stop {p.stop_price != null ? fmt(p.stop_price) : "—"} · target {p.take_profit != null ? fmt(p.take_profit) : "—"}
+                    </dd></div>
+                  )}
+                </div>
+                {p.current_drivers?.length > 0 && (
+                  <ul className="drivers">{p.current_drivers.map((d, i) => <li key={i}>{d}</li>)}</ul>
+                )}
+              </article>
+            );
+          })}
+        </>
+      )}
+
+      {pending.length > 0 && (
+        <div className="pend">
+          <div className="pend-h">Working orders — submitted, not filled</div>
+          {pending.map((o) => (
+            <div key={`${o.symbol}-${o.side}`} className="pend-row">
+              <span className="tkr sm">{o.symbol}</span>
+              <span className="mono">{o.side} {o.qty} @ limit {o.limit_price != null ? fmt(o.limit_price) : "—"}</span>
+              <span className="mono dim">market {o.last_price != null ? fmt(o.last_price) : "—"}</span>
+              <span className="pend-why" style={{ color: (o.gap_to_fill ?? 0) < 0 ? C.coral : C.mut }}>
+                {o.reason}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function BacktestCard({ bt }) {
   if (!bt) return <section className="panel"><div className="panel-head"><h2>Backtest</h2></div><p className="empty">No backtest stored — run sentinel-backtest.</p></section>;
   const m = bt.metrics || {}, spy = bt.benchmarks?.spy_buy_hold, basket = bt.benchmarks?.basket_buy_hold;
@@ -379,18 +467,22 @@ export default function App() {
   const [d, setD] = useState({});
   const [error, setError] = useState(null);
   const [armKill, setArmKill] = useState(false);
+  // The log grows ~7 rows a minute, so default to what actually happened.
+  const [tradesOnly, setTradesOnly] = useState(true);
+  const [logSymbol, setLogSymbol] = useState(null);
 
   const load = useCallback(async () => {
     try {
-      const [wl, health, account, risk, decisions, bt, news, trackers, perf, gate, mode, breakers] = await Promise.all([
+      const [wl, health, account, risk, decisions, bt, news, trackers, perf, gate, mode, breakers, pos, dCounts] = await Promise.all([
         fetchWatchlist(), fetchHealth(), fetchAccount(), fetchRiskProfiles(),
-        fetchDecisions(40), fetchLatestBacktest(), fetchNews(30), fetchTrackers(), fetchPerformance(),
-        fetchGolive(), fetchMode(), fetchBreakers(),
+        fetchDecisionsFiltered({ limit: 60, excludeSkips: tradesOnly, symbol: logSymbol }),
+        fetchLatestBacktest(), fetchNews(30), fetchTrackers(), fetchPerformance(),
+        fetchGolive(), fetchMode(), fetchBreakers(), fetchPositions(), fetchDecisionCounts(),
       ]);
-      setD({ wl, health, account, risk, decisions: decisions || [], bt, news: news || [], trackers: trackers || [], perf, gate, mode, breakers: breakers || [] });
+      setD({ wl, health, account, risk, decisions: decisions || [], bt, news: news || [], trackers: trackers || [], perf, gate, mode, breakers: breakers || [], pos, dCounts });
       setError(null);
     } catch (e) { setError(e.message || "connection error"); }
-  }, []);
+  }, [tradesOnly, logSymbol]);
 
   useEffect(() => { load(); const id = setInterval(load, POLL_MS); return () => clearInterval(id); }, [load]);
 
@@ -399,7 +491,7 @@ export default function App() {
   const onAddTracker = async (h, s) => { await addTracker(h, s); load(); };
   const onRemoveTracker = async (s, h) => { await removeTracker(s, h); load(); };
 
-  const { wl, health, account, risk = { profiles: [], default_risk_factor: 5 }, decisions = [], bt, news = [], trackers = [], perf, gate: goliveGate, mode: sysMode, breakers = [] } = d;
+  const { wl, health, account, risk = { profiles: [], default_risk_factor: 5 }, decisions = [], bt, news = [], trackers = [], perf, gate: goliveGate, mode: sysMode, breakers = [], pos, dCounts } = d;
   const mode = wl?.mode || account?.mode || "—";
   const healthy = health?.status === "ok";
   const tickers = wl?.tickers || [];
@@ -508,25 +600,47 @@ export default function App() {
         {tickers.length === 0 && <p className="empty">No data yet — backfill + train first.</p>}
       </section>
 
+      <PositionsPanel pos={pos} />
+
       <PerfChart perf={perf} />
 
       <div className="two-col">
         <section className="panel">
-          <div className="panel-head"><h2>Decision log</h2><span className="head-note">every action, and every skip</span></div>
+          <div className="panel-head"><h2>Decision log</h2>
+            <span className="head-note">
+              {tradesOnly ? "trades only" : "every action, and every skip"}
+              {dCounts?.SKIP != null && ` · ${dCounts.SKIP.toLocaleString()} skips hidden behind the filter`}
+            </span></div>
+          <div className="log-filters">
+            <button className={"lf" + (tradesOnly ? " on" : "")} onClick={() => setTradesOnly(true)}>
+              Trades only{dCounts && ` (${(dCounts.OPEN || 0) + (dCounts.EXIT || 0) + (dCounts.BREAKER || 0)})`}
+            </button>
+            <button className={"lf" + (!tradesOnly ? " on" : "")} onClick={() => setTradesOnly(false)}>
+              Everything
+            </button>
+            <select className="lf-sym" value={logSymbol || ""} onChange={(e) => setLogSymbol(e.target.value || null)}>
+              <option value="">All tickers</option>
+              {tickers.map((t) => <option key={t.symbol} value={t.symbol}>{t.symbol}</option>)}
+            </select>
+          </div>
           <ol className="feed">
             {decisions.map((f) => (
               <li key={f.id} className="feed-row">
                 <span className="mono feed-time">{timeOf(f.ts)}</span>
                 <div className="feed-main">
                   <div className="feed-head"><span className="tkr sm">{f.symbol}</span>
-                    <span className="act-tag">{f.action}</span><Chip sig={f.signal} />
+                    <span className={"act-tag" + (f.action !== "SKIP" ? " act-live" : "")}>{f.action}</span><Chip sig={f.signal} />
                     <span className="mono conf">conv {Math.round(f.conviction)}</span></div>
                   <p className="feed-act">{f.reason}</p>
                   {f.drivers?.length > 0 && <ul className="why">{f.drivers.map((w, j) => <li key={j}>{w}</li>)}</ul>}
                 </div>
               </li>
             ))}
-            {decisions.length === 0 && <p className="empty">No decisions yet.</p>}
+            {decisions.length === 0 && (
+              <p className="empty">
+                {tradesOnly ? "No trades yet — nothing has been opened or exited." : "No decisions yet."}
+              </p>
+            )}
           </ol>
         </section>
         <SentimentDesk trackers={trackers} onAdd={onAddTracker} onRemove={onRemoveTracker} />
@@ -604,6 +718,30 @@ h2 { font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: $
 .add-hint { flex-basis: 100%; font-size: 10px; color: ${C.mut}; }
 .tkr-rm { background: transparent; border: none; color: ${C.mut}; font-size: 15px; line-height: 1; cursor: pointer; padding: 0 2px; }
 .tkr-rm:hover { color: ${C.coral}; }
+
+/* positions */
+.pos-tot { display: flex; gap: 26px; font-size: 11px; color: ${C.mut}; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid ${C.line}; }
+.pos-tot b { color: ${C.ink}; font-size: 14px; margin-left: 6px; }
+.pos-row { padding: 12px 0; border-bottom: 1px solid ${C.line}; }
+.pos-row:last-child { border-bottom: none; }
+.pos-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pos-qty { font-size: 12px; color: ${C.mut}; }
+.pos-pnl { font-size: 13px; margin-left: auto; }
+.pos-why { display: grid; gap: 3px; margin-top: 8px; }
+.pos-why div { display: flex; gap: 10px; font-size: 11px; line-height: 1.5; }
+.pos-why dt { color: ${C.mut}; margin: 0; min-width: 118px; }
+.pos-why dd { margin: 0; color: ${C.ink}; }
+.pend { margin-top: 16px; padding-top: 12px; border-top: 1px dashed ${C.line}; }
+.pend-h { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: ${C.amber}; margin-bottom: 8px; }
+.pend-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 11px; padding: 5px 0; }
+.pend-why { margin-left: auto; }
+
+/* decision-log filters */
+.log-filters { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+.lf { font: 600 10px 'Space Grotesk'; letter-spacing: .08em; text-transform: uppercase; background: transparent; color: ${C.mut}; border: 1px solid ${C.line}; padding: 6px 10px; border-radius: 5px; cursor: pointer; }
+.lf.on { color: ${C.bg}; background: ${C.teal}; border-color: ${C.teal}; }
+.lf-sym { margin-left: auto; background: ${C.bg}; color: ${C.ink}; border: 1px solid ${C.line}; border-radius: 5px; padding: 5px 8px; font-size: 11px; font-family: inherit; }
+.act-tag.act-live { color: ${C.teal}; border-color: ${C.teal}; }
 .mode { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: .18em; color: ${C.amber}; border: 1px dashed ${C.amber}; padding: 5px 10px; border-radius: 4px; }
 .health { font-size: 11px; border: 1px solid; border-radius: 4px; padding: 5px 10px; }
 .kill { font: 600 11px 'Space Grotesk'; letter-spacing: .1em; text-transform: uppercase; background: transparent; color: ${C.coral}; border: 1px solid ${C.coral}; padding: 7px 12px; border-radius: 6px; cursor: pointer; }

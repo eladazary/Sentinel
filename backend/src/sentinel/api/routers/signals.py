@@ -7,7 +7,11 @@ from sqlalchemy.orm import Session
 
 from sentinel.api.deps import get_db, watchlist_dep
 from sentinel.config import Watchlist
-from sentinel.execution.decision_log import get_latest_signals, recent_decisions
+from sentinel.execution.decision_log import (
+    decision_action_counts,
+    get_latest_signals,
+    recent_decisions,
+)
 from sentinel.schemas import DecisionOut, SignalOut
 
 router = APIRouter(tags=["signals"])
@@ -38,11 +42,31 @@ def signals(
     return out
 
 
+@router.get("/decisions/counts")
+def decision_counts(db: Session = Depends(get_db)) -> dict[str, int]:
+    """Row count per action, so the UI can label its filters."""
+    return decision_action_counts(db)
+
+
 @router.get("/decisions", response_model=list[DecisionOut])
 def decisions(
-    db: Session = Depends(get_db), limit: int = Query(default=50, ge=1, le=500)
+    db: Session = Depends(get_db),
+    limit: int = Query(default=50, ge=1, le=500),
+    actions: str | None = Query(
+        default=None, description="comma-separated, e.g. OPEN,EXIT,BREAKER"
+    ),
+    symbol: str | None = Query(default=None),
+    exclude_skips: bool = Query(
+        default=False, description="hide the per-cycle SKIP noise"
+    ),
 ) -> list[DecisionOut]:
-    rows = recent_decisions(db, limit=limit)
+    rows = recent_decisions(
+        db,
+        limit=limit,
+        actions=actions.split(",") if actions else None,
+        symbol=symbol,
+        exclude_skips=exclude_skips,
+    )
     return [
         DecisionOut(
             id=d.id,

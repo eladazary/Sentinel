@@ -189,3 +189,49 @@ def test_multiple_snapshots_in_one_session_count_once(db):
         _snap(db, datetime(2026, 7, 22, 15, minute, tzinfo=timezone.utc))  # Wed
     db.commit()
     assert trading_days_count(db) == 1
+
+
+# ---- decision log filtering (the log buries real trades under skips) ----
+
+def _decision(session, symbol, action, ts, reason="x", order_id=None):
+    session.add(Decision(
+        ts=ts, symbol=symbol, action=action, signal="BUY", conviction=10.0,
+        confidence=0.5, risk_factor=7, mode="DRY_RUN", reason=reason,
+        drivers=[], broker_order_id=order_id,
+    ))
+
+
+def test_decision_filters(db):
+    from sentinel.execution.decision_log import (
+        decision_action_counts,
+        recent_decisions,
+    )
+
+    base = datetime(2026, 7, 27, 14, 0, tzinfo=timezone.utc)
+    for i in range(20):  # the noise
+        _decision(db, "NVDA", "SKIP", base + timedelta(seconds=i))
+    _decision(db, "AAPL", "OPEN", base + timedelta(seconds=30), order_id="o1")
+    _decision(db, "GOOGL", "OPEN", base + timedelta(seconds=31), order_id="o2")
+    _decision(db, "AAPL", "EXIT", base + timedelta(seconds=40), order_id="o3")
+    db.commit()
+
+    assert len(recent_decisions(db, limit=100)) == 23
+
+    # exclude_skips is the common case: what actually happened.
+    trades = recent_decisions(db, limit=100, exclude_skips=True)
+    assert {d.action for d in trades} == {"OPEN", "EXIT"}
+    assert len(trades) == 3
+
+    # Explicit action list.
+    opens = recent_decisions(db, limit=100, actions=["open"])  # case-insensitive
+    assert len(opens) == 2 and all(d.action == "OPEN" for d in opens)
+
+    # Per-symbol, and it composes with the skip filter.
+    aapl = recent_decisions(db, limit=100, symbol="aapl", exclude_skips=True)
+    assert {d.action for d in aapl} == {"OPEN", "EXIT"}
+    assert all(d.symbol == "AAPL" for d in aapl)
+
+    # Newest first.
+    assert trades[0].action == "EXIT"
+
+    assert decision_action_counts(db) == {"SKIP": 20, "OPEN": 2, "EXIT": 1}

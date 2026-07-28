@@ -11,6 +11,7 @@ from sentinel.api.routers import (
     golive,
     health,
     performance,
+    positions,
     risk,
     sentiment,
     signals,
@@ -46,6 +47,7 @@ def create_app() -> FastAPI:
     app.include_router(account.router)
     app.include_router(sentiment.router)
     app.include_router(performance.router)
+    app.include_router(positions.router)
     app.include_router(golive.router)
 
     @app.get("/", tags=["ops"])
