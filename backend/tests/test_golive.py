@@ -37,14 +37,23 @@ def db(test_database_url):
 
 
 def _seed_equity(session, days, start_equity=100_000, growth=0.001, source="live"):
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    """Seed `days` *trading* days of equity — weekdays only, mid-session.
+
+    A real dry run only accumulates weekdays, and trading_days_count now buckets
+    in market time, so 15:00 UTC (11:00 ET) keeps each row on its own ET day.
+    """
+    ts = datetime(2026, 1, 1, 15, 0, tzinfo=timezone.utc)
     eq = start_equity
-    for i in range(days):
-        eq *= 1 + growth
-        session.add(EquitySnapshot(
-            ts=base + timedelta(days=i), equity=eq, cash=eq, exposure_pct=0.0,
-            mode="DRY_RUN", source=source,
-        ))
+    seeded = 0
+    while seeded < days:
+        if ts.weekday() < 5:  # Mon-Fri
+            eq *= 1 + growth
+            session.add(EquitySnapshot(
+                ts=ts, equity=eq, cash=eq, exposure_pct=0.0,
+                mode="DRY_RUN", source=source,
+            ))
+            seeded += 1
+        ts += timedelta(days=1)
     session.commit()
 
 
@@ -137,3 +146,46 @@ def test_breaker_cooloff_blocks_unlock(db):
     db.commit()
     r = unlock_live(db, s, ["NVDA"], "GO LIVE", now=now + timedelta(hours=1))
     assert not r.ok and "cool-off" in r.reason
+
+
+# ---- trading-day counting (the go-live gate's most load-bearing number) ----
+
+def _snap(session, ts, source="live"):
+    session.add(EquitySnapshot(
+        ts=ts, equity=100_000, cash=100_000, exposure_pct=0.0,
+        mode="DRY_RUN", source=source,
+    ))
+
+
+def test_weekends_do_not_count_as_trading_days(db):
+    from sentinel.system_state import trading_days_count
+
+    # Mon-Fri 2026-07-20..24, then Sat 25 and Sun 26 (all 15:00 UTC = 11:00 ET).
+    for day in range(20, 27):
+        _snap(db, datetime(2026, 7, day, 15, 0, tzinfo=timezone.utc))
+    db.commit()
+    # 7 calendar days present, but only the 5 weekdays are trading days.
+    assert trading_days_count(db) == 5
+
+
+def test_day_is_bucketed_in_market_time_not_utc(db):
+    """00:30 UTC Saturday is 20:30 Friday in New York — a real trading day."""
+    from sentinel.system_state import trading_days_count
+
+    _snap(db, datetime(2026, 7, 25, 0, 30, tzinfo=timezone.utc))  # Fri 20:30 ET
+    db.commit()
+    assert trading_days_count(db) == 1
+
+    # Whereas mid-day Saturday ET is not, and must not add a second day.
+    _snap(db, datetime(2026, 7, 25, 16, 0, tzinfo=timezone.utc))  # Sat 12:00 ET
+    db.commit()
+    assert trading_days_count(db) == 1
+
+
+def test_multiple_snapshots_in_one_session_count_once(db):
+    from sentinel.system_state import trading_days_count
+
+    for minute in (0, 15, 30, 45):
+        _snap(db, datetime(2026, 7, 22, 15, minute, tzinfo=timezone.utc))  # Wed
+    db.commit()
+    assert trading_days_count(db) == 1

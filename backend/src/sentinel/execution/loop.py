@@ -69,9 +69,46 @@ def _day_start_and_hwm(
     return day_start, high_water
 
 
-def _mark_to_market(
-    session_factory: SessionFactory, watchlist: Watchlist, broker: Broker
-) -> None:
+@dataclass(frozen=True)
+class Quote:
+    """A live price plus how old our observation of it is."""
+
+    price: float
+    age_seconds: float
+
+    def fresh(self, max_age: float) -> bool:
+        return self.age_seconds <= max_age
+
+
+def _live_quotes(
+    session_factory: SessionFactory, watchlist: Watchlist, now: datetime
+) -> dict[str, Quote]:
+    """Latest observed price per symbol, aged by when *we* fetched it.
+
+    ``LatestPrice.ts`` is the provider's own stamp and is only date-resolution
+    for some feeds, so freshness is measured from ``updated_at`` — the instant
+    the worker actually pulled the quote.
+    """
+    try:
+        with session_factory() as session:
+            rows = get_latest_prices(session, watchlist.symbols)
+    except Exception:  # noqa: BLE001 - never fail a cycle on a read
+        log.warning("could not load live quotes", exc_info=True)
+        return {}
+
+    out: dict[str, Quote] = {}
+    for symbol, row in rows.items():
+        # No observation time means we can't vouch for the price: treat it as
+        # infinitely stale rather than assume it's current.
+        seen = getattr(row, "updated_at", None)
+        if seen is not None and seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+        age = (now - seen).total_seconds() if seen is not None else float("inf")
+        out[symbol] = Quote(price=float(row.price), age_seconds=age)
+    return out
+
+
+def _mark_to_market(broker: Broker, quotes: dict[str, Quote]) -> None:
     """Feed the latest prices to a broker that marks its own book.
 
     Only the sim needs this — Alpaca marks positions itself. Without it the sim
@@ -79,19 +116,55 @@ def _mark_to_market(
     no stop or target ever triggers.
     """
     mark = getattr(broker, "mark", None)
-    if mark is None:
+    if mark is None or not quotes:
         return
     try:
-        with session_factory() as session:
-            prices = {
-                symbol: float(row.price)
-                for symbol, row in get_latest_prices(session, watchlist.symbols).items()
-            }
-        if prices:
-            for symbol in mark(prices):
-                log.info("sim bracket triggered, closed %s", symbol)
+        for symbol in mark({s: q.price for s, q in quotes.items()}):
+            log.info("sim bracket triggered, closed %s", symbol)
     except Exception:  # noqa: BLE001 - marking is best-effort, never fail a cycle
         log.warning("could not mark the sim to market", exc_info=True)
+
+
+def _cancel_unfillable_buys(
+    broker: Broker, quotes: dict[str, Quote], settings: Settings
+) -> set[tuple[str, str]]:
+    """Cancel resting buy limits that sit below the market. Returns freed keys.
+
+    A buy limit under the current price is dead: it cannot fill, but it still
+    counts as a working order, so the duplicate guard skips the symbol every
+    cycle. Cancelling lets the next cycle re-price against a live quote.
+    """
+    cancel = getattr(broker, "cancel_order", None)
+    orders = getattr(broker, "open_orders", None)
+    if cancel is None or orders is None:
+        return set()
+
+    freed: set[tuple[str, str]] = set()
+    try:
+        working = orders()
+    except Exception:  # noqa: BLE001 - never fail a cycle on a broker read
+        log.warning("could not list working orders", exc_info=True)
+        return freed
+
+    for o in working:
+        if o.side != "buy" or o.limit_price is None:
+            continue
+        q = quotes.get(o.symbol)
+        if q is None or not q.fresh(settings.entry_max_quote_age_seconds):
+            continue
+        if o.limit_price >= q.price:
+            continue  # still at or above the market, leave it working
+        try:
+            cancel(o.id)
+        except Exception:  # noqa: BLE001 - a failed cancel just leaves it working
+            log.warning("could not cancel stale order %s for %s", o.id, o.symbol)
+            continue
+        freed.add((o.symbol, "buy"))
+        log.info(
+            "cancelled unfillable %s buy: limit %.2f is below the market at %.2f",
+            o.symbol, o.limit_price, q.price,
+        )
+    return freed
 
 
 def run_cycle(
@@ -114,10 +187,15 @@ def run_cycle(
     profile = risk_profile(risk_factor)
     gate = profile.min_conviction
 
-    _mark_to_market(session_factory, watchlist, broker)
+    quotes = _live_quotes(session_factory, watchlist, now)
+    _mark_to_market(broker, quotes)
     account = broker.get_account()
     positions = broker.get_positions()
     open_keys = set(broker.open_order_keys())
+    # Resting buy limits that the market has already left behind can never fill,
+    # and the duplicate-order guard would otherwise let them block the symbol
+    # for the rest of the session.
+    open_keys -= _cancel_unfillable_buys(broker, quotes, settings)
     report = CycleReport(ran_at=now, mode=settings.mode, equity=account.equity)
 
     invested = sum(p.market_value for p in positions.values())
@@ -220,7 +298,12 @@ def run_cycle(
             )
 
             bars = load_bars(session, symbol)
-            last_price = float(bars["close"].iloc[-1]) if not bars.empty else None
+            # The daily close is the model's reference (it's what the features
+            # were built from). Execution must not use it: it can be days old,
+            # and a limit derived from it lands below a market that has moved.
+            last_close = float(bars["close"].iloc[-1]) if not bars.empty else None
+            quote = quotes.get(symbol)
+            last_price = last_close
 
             common = dict(
                 conviction=conv.conviction, confidence=conv.confidence,
@@ -293,9 +376,24 @@ def run_cycle(
                 if policy == "reduced":
                     earnings_size_mult = 0.5
 
-            atr = float(row["atr_pct"]) * last_price
+            # Entries price off the live quote, never the daily close. Refuse
+            # rather than guess: a limit built on a stale reference either misses
+            # the market entirely or overpays into a gap.
+            max_age = settings.entry_max_quote_age_seconds
+            if quote is None or not quote.fresh(max_age):
+                age = "no quote" if quote is None else f"{quote.age_seconds:.0f}s old"
+                dlog.log_decision(
+                    session, ts=now, symbol=symbol, action="SKIP", signal=signal,
+                    reason=f"no fresh quote to price the entry ({age}, max {max_age:.0f}s)",
+                    **common,
+                )
+                report.add(symbol, "SKIP", "stale quote")
+                continue
+            exec_price = quote.price
+
+            atr = float(row["atr_pct"]) * exec_price
             sizing = size_position(
-                equity=account.equity * earnings_size_mult, price=last_price, atr=atr,
+                equity=account.equity * earnings_size_mult, price=exec_price, atr=atr,
                 profile=profile, current_exposure_value=invested,
             )
             if sizing.blocked:
@@ -307,10 +405,12 @@ def run_cycle(
                 report.add(symbol, "SKIP", sizing.reason)
                 continue
 
-            limit_price = round(last_price * 1.001, 2)  # marketable buy offset
+            # Marketable buy: cross the spread by a small, bounded amount so the
+            # order fills promptly without becoming an unpriced market order.
+            limit_price = round(exec_price * (1.0 + settings.entry_limit_offset_pct / 100.0), 2)
             chk = validate_order(
                 symbol=symbol, side="buy", qty=sizing.shares, limit_price=limit_price,
-                last_price=last_price, equity=account.equity, pending_keys=open_keys,
+                last_price=exec_price, equity=account.equity, pending_keys=open_keys,
             )
             if not chk.ok:
                 dlog.log_decision(

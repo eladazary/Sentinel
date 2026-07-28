@@ -111,6 +111,7 @@ def ingest_latest_prices(
     *,
     now: datetime | None = None,
     session_factory: SessionFactory = session_scope,
+    source: str = "unknown",
 ) -> int:
     """Fetch and store the latest price for each symbol. Returns count updated."""
     if not symbols:
@@ -120,8 +121,11 @@ def ingest_latest_prices(
     updated = 0
     with session_factory() as session:
         for symbol, (price, ts) in prices.items():
+            # Record the provider that actually served the quote. This used to
+            # default to "alpaca" regardless, which made yfinance daily closes
+            # look like live Alpaca trades.
             repo.upsert_latest_price(
-                session, symbol, price, ts, updated_at=observed_at
+                session, symbol, price, ts, updated_at=observed_at, source=source
             )
             updated += 1
     log.info("latest prices updated for %d/%d symbols", updated, len(symbols))
@@ -135,21 +139,52 @@ def iter_batches(items: list, size: int) -> Iterator[list]:
 
 
 def make_market_data(settings) -> MarketData:
-    """Pick a market-data provider.
+    """Pick a provider for *historical* backfill.
 
-    Prefers yfinance for backfill (free, no keys). Falls back to Alpaca when
-    explicitly configured with credentials.
+    Prefers yfinance (free, no keys, and no rate limit worth worrying about for
+    years of daily bars). Falls back to Alpaca when explicitly configured.
     """
     from sentinel.ingestion.yfinance_source import YFinanceMarketData
 
     if settings.backfill_source == "alpaca":
         if not settings.has_alpaca_credentials:
             raise ValueError("backfill_source=alpaca but Alpaca credentials are unset")
-        from sentinel.ingestion.alpaca import AlpacaMarketData
-
-        return AlpacaMarketData(
-            settings.alpaca_api_key,
-            settings.alpaca_secret_key,
-            settings.alpaca_data_feed,
-        )
+        return _alpaca_market_data(settings)
     return YFinanceMarketData()
+
+
+def make_quote_source(settings) -> tuple[MarketData, str]:
+    """Pick a provider for *live quotes*, and name it. Returns (provider, name).
+
+    Deliberately separate from backfill. yfinance's ``get_latest_prices`` returns
+    the most recent daily *close*, so using it here means every order is priced
+    off yesterday's number — it cannot fill in a market that has moved, and the
+    entry staleness guard rejects it. Alpaca returns the latest trade, and it is
+    the venue the order goes to, so its quote is the right reference.
+    """
+    resolved = settings.quote_source
+    if resolved == "auto":
+        resolved = "alpaca" if settings.has_alpaca_credentials else "yfinance"
+    if resolved == "alpaca":
+        if not settings.has_alpaca_credentials:
+            raise ValueError("quote_source=alpaca but Alpaca credentials are unset")
+        return _alpaca_market_data(settings), "alpaca"
+
+    log.warning(
+        "quotes are coming from yfinance, which reports the last daily CLOSE — "
+        "entries will be priced off stale data and are likely to be rejected by "
+        "the freshness guard. Configure Alpaca credentials for live quotes."
+    )
+    from sentinel.ingestion.yfinance_source import YFinanceMarketData
+
+    return YFinanceMarketData(), "yfinance"
+
+
+def _alpaca_market_data(settings):
+    from sentinel.ingestion.alpaca import AlpacaMarketData
+
+    return AlpacaMarketData(
+        settings.alpaca_api_key,
+        settings.alpaca_secret_key,
+        settings.alpaca_data_feed,
+    )

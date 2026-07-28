@@ -18,10 +18,12 @@ from sentinel.config import get_settings
 from sentinel.db import get_engine, session_scope
 from sentinel.execution.factory import make_broker_with_status
 from sentinel.execution.loop import run_cycle
+from sentinel.execution.scheduler import is_market_open
 from sentinel.ingestion.prices import (
     backfill_symbols,
     ingest_latest_prices,
     make_market_data,
+    make_quote_source,
 )
 from sentinel.logging_config import configure_logging, get_logger
 from sentinel.model.technical import TechnicalModel
@@ -111,11 +113,16 @@ def run() -> None:
         watchlist = load_universe(session, settings)
     log.info("watchlist: %s", ", ".join(watchlist.symbols))
 
-    # Backfill source is yfinance by default (free, no keys); Alpaca is used for
-    # execution. All ingest symbols = watchlist + benchmark/sector/VIX context.
+    # All ingest symbols = watchlist + benchmark/sector/VIX context.
     symbols = settings.all_ingest_symbols(watchlist)
     md = make_market_data(settings)
-    log.info("backfilling %d symbols via %s", len(symbols), settings.backfill_source)
+    # Quotes come from their own provider: backfill wants years of free daily
+    # bars, whereas order pricing needs a live trade feed.
+    quote_md, quote_name = make_quote_source(settings)
+    log.info(
+        "backfill via %s; live quotes via %s",
+        settings.backfill_source, quote_name,
+    )
     try:
         backfill_symbols(md, symbols, settings.backfill_years)
     except Exception:  # noqa: BLE001 - never crash the loop on a backfill error
@@ -143,6 +150,7 @@ def run() -> None:
         "entering loop (every %ds): ingest prices → [sentiment] → signals → paper cycle",
         settings.ingest_interval_seconds,
     )
+    was_open: bool | None = None
     while _running:
         # Pick up tickers added through the API, and give each one its price
         # history before the model is asked to score it.
@@ -151,11 +159,25 @@ def run() -> None:
         except Exception:  # noqa: BLE001 - keep the loop alive
             log.exception("universe sync failed")
 
-        try:
-            ingest_latest_prices(md, symbols)
-        except Exception:  # noqa: BLE001 - keep the loop alive
-            log.exception("latest-price ingestion failed")
+        # Prices and the trading cycle are session-only. Quotes don't move when
+        # the market is shut, and a cycle run then would record an equity
+        # snapshot for a day no order could be placed on — which is what used to
+        # inflate the go-live gate's trading-day count with weekends.
+        market_open = is_market_open(datetime.now(timezone.utc))
+        if market_open is not was_open:
+            log.info("market %s — %s", "open" if market_open else "closed",
+                     "resuming price ingest + trading cycle" if market_open
+                     else "pausing price ingest + trading cycle (sentiment continues)")
+            was_open = market_open
 
+        if market_open:
+            try:
+                ingest_latest_prices(quote_md, symbols, source=quote_name)
+            except Exception:  # noqa: BLE001 - keep the loop alive
+                log.exception("latest-price ingestion failed")
+
+        # Sentiment keeps running regardless: filings and retail chatter arrive
+        # outside session hours, and weekends are when chatter peaks.
         if cycle_count % refresh_every == 0:
             try:
                 refresh_sentiment(
@@ -166,7 +188,9 @@ def run() -> None:
             except Exception:  # noqa: BLE001
                 log.exception("sentiment refresh failed")
 
-        if model is not None:
+        if not market_open:
+            _heartbeat("ok:market-closed")
+        elif model is not None:
             try:
                 report = run_cycle(
                     session_factory=session_scope,

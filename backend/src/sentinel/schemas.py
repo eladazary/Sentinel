@@ -41,6 +41,57 @@ class WatchlistTicker(BaseModel):
     drivers: list[str] = []
 
 
+class HeldPosition(BaseModel):
+    """A filled holding, joined to the rationale that opened it."""
+
+    symbol: str
+    name: str | None = None
+    qty: int
+    avg_entry: float
+    last_price: float | None = None
+    market_value: float
+    unrealized_pnl: float | None = None
+    unrealized_pnl_pct: float | None = None
+    # Why we're in it: the OPEN decision that created the position.
+    opened_at: datetime | None = None
+    entry_reason: str | None = None
+    entry_conviction: float | None = None
+    entry_drivers: list[str] = []
+    # Why we're still in it: the current read on the same name.
+    current_signal: str | None = None
+    current_conviction: float | None = None
+    current_drivers: list[str] = []
+    stop_price: float | None = None
+    take_profit: float | None = None
+
+
+class PendingOrder(BaseModel):
+    """Submitted but unfilled — intent, not a holding."""
+
+    symbol: str
+    name: str | None = None
+    qty: int
+    side: str
+    status: str
+    limit_price: float | None = None
+    last_price: float | None = None
+    # Negative means the limit sits below the market and cannot fill.
+    gap_to_fill: float | None = None
+    submitted_at: datetime | None = None
+    reason: str | None = None
+
+
+class PositionsResponse(BaseModel):
+    mode: str
+    broker: str | None = None
+    available: bool
+    positions: list[HeldPosition] = []
+    pending: list[PendingOrder] = []
+    total_market_value: float = 0.0
+    total_unrealized_pnl: float = 0.0
+    detail: str | None = None
+
+
 class WatchlistResponse(BaseModel):
     mode: str
     count: int

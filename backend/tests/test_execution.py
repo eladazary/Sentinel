@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -151,6 +151,14 @@ def _feature_frame():
     return pd.DataFrame(data, index=idx)
 
 
+def _quote(price, age_seconds=0.0):
+    """A LatestPrice-shaped row. Entries now require a *fresh* quote."""
+    return SimpleNamespace(
+        price=price,
+        updated_at=datetime.now(timezone.utc) - timedelta(seconds=age_seconds),
+    )
+
+
 @pytest.fixture
 def patched_loop(monkeypatch):
     logged: list[dict] = []
@@ -161,7 +169,11 @@ def patched_loop(monkeypatch):
     )
     monkeypatch.setattr(loop_mod, "_day_start_and_hwm", lambda s, n, e: (e, e))
     monkeypatch.setattr(loop_mod, "get_sentiment_cache", lambda s, syms: {})
-    monkeypatch.setattr(loop_mod, "get_latest_prices", lambda s, syms: {})
+    # Fresh quotes by default: the entry path prices off the live quote.
+    monkeypatch.setattr(
+        loop_mod, "get_latest_prices",
+        lambda s, syms: {sym: _quote(100.0) for sym in syms},
+    )
     monkeypatch.setattr(loop_mod, "is_in_blackout", lambda s, sym, n, h: False)
     monkeypatch.setattr(loop_mod, "ensure_dry_run_started", lambda s, n=None: None)
     monkeypatch.setattr(loop_mod, "record_breaker_event", lambda s, **kw: None)
@@ -179,7 +191,7 @@ def _watchlist():
 
 
 def _settings():
-    return Settings(default_risk_factor=10)  # gate 35, easy to trigger BUY
+    return Settings(default_risk_factor=10)  # most permissive gate, easy to fire BUY
 
 
 def test_loop_opens_position(patched_loop):
@@ -211,7 +223,7 @@ def test_loop_marks_sim_to_market(patched_loop, monkeypatch):
     broker.submit_bracket("AAA", 100, 100.0, 95.0, 110.0)
     monkeypatch.setattr(
         loop_mod, "get_latest_prices",
-        lambda s, syms: {"AAA": SimpleNamespace(price=94.0)},  # below the stop
+        lambda s, syms: {"AAA": _quote(94.0)},  # below the stop
     )
     loop_mod.run_cycle(
         session_factory=_fake_session, settings=_settings(), watchlist=_watchlist(),
@@ -233,3 +245,140 @@ def test_loop_breaker_flattens(patched_loop, monkeypatch):
     )
     assert report.breaker_tripped
     assert broker.get_positions() == {}
+
+
+# ---- market-hours gating of the loop ----
+
+def test_market_open_boundaries():
+    """What the worker uses to decide whether to run a cycle at all."""
+    # Wednesday 2026-07-22.
+    wed = datetime(2026, 7, 22, 9, 29, tzinfo=ET)
+    assert is_market_open(wed) is False               # 09:29 — before the open
+    assert is_market_open(wed.replace(hour=9, minute=30)) is True
+    assert is_market_open(wed.replace(hour=15, minute=59)) is True
+    assert is_market_open(wed.replace(hour=16, minute=0)) is False  # closed at 16:00
+
+    # Saturday 2026-07-25 — closed at every hour.
+    sat = datetime(2026, 7, 25, 12, 0, tzinfo=ET)
+    assert sat.weekday() == 5
+    assert is_market_open(sat) is False
+    assert is_market_open(sat.replace(hour=20)) is False
+
+
+def test_cycle_records_equity_but_saturday_is_closed(patched_loop, monkeypatch):
+    """The worker gates run_cycle on is_market_open, so a shut market records
+    nothing — that's what invented weekend 'trading days' in the go-live gate."""
+    recorded = []
+    monkeypatch.setattr(
+        loop_mod.dlog, "record_equity",
+        lambda session, **kw: recorded.append(kw["ts"]),
+    )
+    broker = SimBroker(cash=100_000)
+    broker.set_prices({"AAA": 100.0})
+
+    loop_mod.run_cycle(
+        session_factory=_fake_session, settings=_settings(), watchlist=_watchlist(),
+        broker=broker, model=FakeModel(0.52), enforce_entry_window=False,
+    )
+    assert len(recorded) == 1  # a cycle that does run still records equity
+
+    saturday = datetime(2026, 7, 25, 12, 0, tzinfo=ET)
+    assert is_market_open(saturday) is False  # so the worker never calls it
+
+
+# ---- entry pricing: live quote, never the stale daily close ----
+
+def test_entry_prices_off_the_live_quote_not_the_daily_close(patched_loop, monkeypatch):
+    """The bug: limits built on a days-old close land below the market."""
+    submitted = {}
+
+    class RecordingBroker(SimBroker):
+        def submit_bracket(self, symbol, qty, limit_price, stop_price, take_profit):
+            submitted.update(
+                symbol=symbol, qty=qty, limit=limit_price,
+                stop=stop_price, tp=take_profit,
+            )
+            return super().submit_bracket(symbol, qty, limit_price, stop_price, take_profit)
+
+    broker = RecordingBroker(cash=100_000)
+    # Daily close is 100 (from the fixture); the market has since moved to 130.
+    monkeypatch.setattr(
+        loop_mod, "get_latest_prices", lambda s, syms: {"AAA": _quote(130.0)}
+    )
+    loop_mod.run_cycle(
+        session_factory=_fake_session, settings=_settings(), watchlist=_watchlist(),
+        broker=broker, model=FakeModel(0.95), enforce_entry_window=False,
+    )
+    # Priced off 130, not 100 — and above it, so it can actually fill.
+    assert submitted["limit"] > 130.0
+    assert submitted["limit"] == pytest.approx(130.0 * 1.0025, abs=0.01)
+    # Stop and target hang off the real entry price too.
+    assert submitted["stop"] < 130.0 < submitted["tp"]
+
+
+def test_entry_is_refused_on_a_stale_quote(patched_loop, monkeypatch):
+    """Better no trade than a limit priced on a quote we can't vouch for."""
+    monkeypatch.setattr(
+        loop_mod, "get_latest_prices",
+        lambda s, syms: {"AAA": _quote(130.0, age_seconds=9_999)},
+    )
+    broker = SimBroker(cash=100_000)
+    report = loop_mod.run_cycle(
+        session_factory=_fake_session, settings=_settings(), watchlist=_watchlist(),
+        broker=broker, model=FakeModel(0.95), enforce_entry_window=False,
+    )
+    assert "AAA" not in broker.get_positions()
+    assert any(a["reason"] == "stale quote" for a in report.actions)
+
+
+def test_unfillable_resting_buy_is_cancelled_not_left_to_block(monkeypatch):
+    """A buy limit below the market can't fill but still blocks the symbol."""
+    from sentinel.execution.broker import WorkingOrder
+
+    cancelled = []
+
+    class StuckBroker(SimBroker):
+        def open_order_keys(self):
+            return {("AAA", "buy")}
+
+        def open_orders(self):
+            return [WorkingOrder(
+                id="o1", symbol="AAA", qty=10, side="buy",
+                status="new", limit_price=100.0,
+            )]
+
+        def cancel_order(self, order_id):
+            cancelled.append(order_id)
+            return True
+
+    freed = loop_mod._cancel_unfillable_buys(
+        StuckBroker(cash=100_000),
+        {"AAA": loop_mod.Quote(price=130.0, age_seconds=1.0)},  # market ran away
+        _settings(),
+    )
+    assert cancelled == ["o1"]
+    assert freed == {("AAA", "buy")}
+
+
+def test_a_still_viable_resting_buy_is_left_alone():
+    from sentinel.execution.broker import WorkingOrder
+
+    cancelled = []
+
+    class Broker(SimBroker):
+        def open_orders(self):
+            return [WorkingOrder(
+                id="o1", symbol="AAA", qty=10, side="buy",
+                status="new", limit_price=131.0,  # at/above the market
+            )]
+
+        def cancel_order(self, order_id):
+            cancelled.append(order_id)
+            return True
+
+    freed = loop_mod._cancel_unfillable_buys(
+        Broker(cash=100_000),
+        {"AAA": loop_mod.Quote(price=130.0, age_seconds=1.0)},
+        _settings(),
+    )
+    assert cancelled == [] and freed == set()

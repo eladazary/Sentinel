@@ -20,7 +20,12 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 
-from sentinel.execution.broker import AccountSnapshot, BrokerPosition, OrderResult
+from sentinel.execution.broker import (
+    AccountSnapshot,
+    BrokerPosition,
+    OrderResult,
+    WorkingOrder,
+)
 
 
 class AlpacaBroker:
@@ -54,6 +59,26 @@ class AlpacaBroker:
             GetOrdersRequest(status=QueryOrderStatus.OPEN)
         )
         return {(o.symbol, o.side.value.lower()) for o in orders}
+
+    def open_orders(self) -> list[WorkingOrder]:
+        orders = self._client.get_orders(
+            GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        )
+        out: list[WorkingOrder] = []
+        for o in orders:
+            limit = getattr(o, "limit_price", None)
+            out.append(
+                WorkingOrder(
+                    id=str(o.id),
+                    symbol=o.symbol,
+                    qty=int(float(o.qty or 0)),
+                    side=o.side.value.lower(),
+                    status=str(getattr(o.status, "value", o.status)),
+                    limit_price=float(limit) if limit is not None else None,
+                    submitted_at=getattr(o, "submitted_at", None),
+                )
+            )
+        return out
 
     def submit_bracket(
         self,
@@ -90,6 +115,10 @@ class AlpacaBroker:
             side="sell",
             status=str(getattr(o, "status", "accepted")),
         )
+
+    def cancel_order(self, order_id: str) -> bool:
+        self._client.cancel_order_by_id(order_id)
+        return True
 
     def cancel_all_orders(self) -> int:
         return len(self._client.cancel_orders() or [])

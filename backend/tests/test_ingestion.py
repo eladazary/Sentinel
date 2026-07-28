@@ -148,3 +148,75 @@ def test_ingest_latest_prices_empty(monkeypatch):
     md = FakeMarketData()
     assert prices.ingest_latest_prices(md, [], session_factory=_fake_session) == 0
     assert md.latest_calls == []
+
+
+# ---- quote source is separate from backfill ----
+
+def test_auto_quote_source_prefers_alpaca_when_credentials_exist():
+    from sentinel.config import Settings
+    from sentinel.ingestion.prices import make_quote_source
+
+    s = Settings(alpaca_api_key="PKTEST", alpaca_secret_key="secret")
+    _, name = make_quote_source(s)
+    assert name == "alpaca"
+
+
+def test_auto_quote_source_falls_back_to_yfinance_without_credentials():
+    from sentinel.config import Settings
+    from sentinel.ingestion.prices import make_quote_source
+
+    s = Settings(alpaca_api_key=None, alpaca_secret_key=None)
+    _, name = make_quote_source(s)
+    assert name == "yfinance"
+
+
+def test_quote_source_is_independent_of_backfill_source():
+    """Backfill on yfinance must not drag quotes onto daily closes with it."""
+    from sentinel.config import Settings
+    from sentinel.ingestion.prices import make_quote_source
+
+    s = Settings(
+        backfill_source="yfinance",
+        alpaca_api_key="PKTEST",
+        alpaca_secret_key="secret",
+    )
+    assert s.backfill_source == "yfinance"
+    _, name = make_quote_source(s)
+    assert name == "alpaca"
+
+
+def test_explicit_alpaca_quote_source_requires_credentials():
+    from sentinel.config import Settings
+    from sentinel.ingestion.prices import make_quote_source
+
+    s = Settings(quote_source="alpaca", alpaca_api_key=None, alpaca_secret_key=None)
+    with pytest.raises(ValueError, match="credentials are unset"):
+        make_quote_source(s)
+
+
+def test_ingest_records_the_provider_that_served_the_quote(monkeypatch):
+    """The source column used to say "alpaca" even for yfinance closes."""
+    from contextlib import contextmanager
+    from datetime import datetime, timezone
+
+    from sentinel.ingestion import prices as prices_mod
+
+    captured = []
+
+    @contextmanager
+    def fake_session():
+        yield object()
+
+    monkeypatch.setattr(
+        prices_mod.repo, "upsert_latest_price",
+        lambda session, symbol, price, ts, updated_at, source="alpaca": captured.append(source),
+    )
+    md = SimpleNamespace(
+        get_latest_prices=lambda syms: {
+            s: (1.0, datetime.now(timezone.utc)) for s in syms
+        }
+    )
+    prices_mod.ingest_latest_prices(
+        md, ["AAA"], session_factory=fake_session, source="yfinance"
+    )
+    assert captured == ["yfinance"]

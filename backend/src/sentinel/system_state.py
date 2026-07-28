@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from sentinel.models import BreakerEvent, EquitySnapshot, SystemState
@@ -55,10 +55,46 @@ def record_breaker_event(
     state.updated_at = ts
 
 
+MARKET_TZ = "America/New_York"
+
+
 def trading_days_count(session: Session) -> int:
-    """Distinct calendar days with an equity snapshot (a proxy for dry-run days)."""
+    """Distinct *trading* days with an equity snapshot.
+
+    Two corrections over a plain count of calendar dates, both of which inflated
+    the go-live gate's "≥ N trading days on paper" criterion:
+
+    1. Weekends are excluded. The worker records equity every cycle, so any
+       weekend it happened to be running used to count as a day of paper
+       trading — days on which no order could possibly have been placed.
+    2. The day is bucketed in market time, not UTC. A snapshot at 00:30 UTC
+       Saturday is 20:30 Friday in New York, i.e. a genuine trading day; naive
+       UTC bucketing both drops it and invents a Saturday.
+
+    The two sources carry different kinds of timestamp, so each is bucketed on
+    its own terms:
+
+    * ``replay`` rows are *date markers* taken from the daily-bar index and
+      stamped at midnight UTC. They are trading days by construction. Converting
+      them to market time would shift each back to the previous evening and drop
+      every Monday.
+    * ``live`` rows are real instants, so they are bucketed in market time and
+      filtered to weekdays.
+
+    Market holidays are still counted if a live snapshot exists for one. Since
+    the loop only runs the cycle while ``is_market_open``, that can only happen
+    for rows written before this change.
+    """
+    et = func.timezone(MARKET_TZ, EquitySnapshot.ts)
+    is_replay = EquitySnapshot.source == "replay"
+    day = case((is_replay, func.date(EquitySnapshot.ts)), else_=func.date(et))
+    counts = case(
+        (is_replay, True),
+        # Postgres dow: 0 = Sunday … 6 = Saturday.
+        else_=func.extract("dow", et).between(1, 5),
+    )
     return session.execute(
-        select(func.count(func.distinct(func.date(EquitySnapshot.ts))))
+        select(func.count(func.distinct(day))).where(counts)
     ).scalar_one()
 
 

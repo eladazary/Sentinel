@@ -10,7 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from itertools import count
 
-from sentinel.execution.broker import AccountSnapshot, BrokerPosition, OrderResult
+from sentinel.execution.broker import (
+    AccountSnapshot,
+    BrokerPosition,
+    OrderResult,
+    WorkingOrder,
+)
 
 
 @dataclass
@@ -53,6 +58,9 @@ class SimBroker:
         # Sim fills instantly, so there are never working orders.
         return set()
 
+    def open_orders(self) -> list[WorkingOrder]:
+        return []  # nothing ever working
+
     def submit_bracket(
         self,
         symbol: str,
@@ -84,6 +92,9 @@ class SimBroker:
         res = OrderResult(oid, symbol, pos.qty, "sell", "filled")
         self.fills.append(res)
         return res
+
+    def cancel_order(self, order_id: str) -> bool:
+        return False  # sim fills instantly, so there is nothing to cancel
 
     def cancel_all_orders(self) -> int:
         return 0  # nothing ever working

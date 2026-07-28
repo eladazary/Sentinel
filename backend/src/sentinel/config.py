@@ -189,6 +189,25 @@ class Settings(BaseSettings):
 
     # Ensemble weights (spec §5). Social starts reduced until it has ~3 months of
     # live-shadow evidence (spec §8).
+    # Where *live quotes* come from, independently of historical backfill.
+    # This must not be yfinance: its get_latest_prices returns the most recent
+    # daily close, so orders priced from it land on yesterday's number and never
+    # fill. "auto" uses Alpaca (the execution venue, and a real trade feed) when
+    # credentials exist, and falls back to yfinance so the dashboard still shows
+    # something without keys.
+    quote_source: str = "auto"
+
+    # --- entry execution ---
+    # How far above the live quote a marketable buy limit is placed. Big enough
+    # to cross a normal spread, small enough to bound the worst fill. Entries
+    # used to price off the last *daily close* with a 0.1% offset, which left
+    # limits sitting below a market that had moved on.
+    entry_limit_offset_pct: float = 0.25
+    # Refuse to place an entry priced on a quote older than this. The worker
+    # refreshes prices every cycle while the market is open, so anything much
+    # older means the feed is broken, not that the stock is quiet.
+    entry_max_quote_age_seconds: float = 300.0
+
     weight_technical: float = 0.45
     weight_news: float = 0.30
     weight_social: float = 0.10
@@ -244,6 +263,14 @@ class Settings(BaseSettings):
         v = v.strip().lower()
         if v not in {"yfinance", "alpaca"}:
             raise ValueError("backfill_source must be 'yfinance' or 'alpaca'")
+        return v
+
+    @field_validator("quote_source")
+    @classmethod
+    def _valid_quote_source(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in {"auto", "yfinance", "alpaca"}:
+            raise ValueError("quote_source must be 'auto', 'yfinance' or 'alpaca'")
         return v
 
     @field_validator("sentiment_engine")

@@ -9,6 +9,7 @@ broker even if Sentinel dies (spec §7).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 
@@ -36,6 +37,23 @@ class OrderResult:
     status: str
 
 
+@dataclass
+class WorkingOrder:
+    """An order that is live at the broker but not yet filled.
+
+    Distinct from a position: the decision log records intent at submit time, so
+    without this an unfilled order reads as a holding that doesn't exist.
+    """
+
+    id: str
+    symbol: str
+    qty: int
+    side: str
+    status: str
+    limit_price: float | None = None
+    submitted_at: datetime | None = None
+
+
 class Broker(Protocol):
     def get_account(self) -> AccountSnapshot: ...
 
@@ -43,6 +61,10 @@ class Broker(Protocol):
 
     def open_order_keys(self) -> set[tuple[str, str]]:
         """Set of (symbol, side) for working orders — for the duplicate guard."""
+        ...
+
+    def open_orders(self) -> list[WorkingOrder]:
+        """Working orders in full, for showing unfilled intent on the dashboard."""
         ...
 
     def submit_bracket(
@@ -55,6 +77,10 @@ class Broker(Protocol):
     ) -> OrderResult: ...
 
     def close_position(self, symbol: str) -> OrderResult | None: ...
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel one working order, e.g. a buy limit left behind by the market."""
+        ...
 
     def cancel_all_orders(self) -> int: ...
 
