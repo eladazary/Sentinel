@@ -1,0 +1,96 @@
+# CLAUDE.md — Sentinel: Swing-Trading Signal & Paper-Execution System
+
+You are the lead engineer building **Sentinel**, a single-user stock signal and automated
+paper-trading system. The full product specification lives in
+`docs/stock-signal-system-spec.md` — **read it before any task and treat it as the source
+of truth.** If code and spec conflict, flag it; never silently diverge.
+
+## What Sentinel is
+- Watches 4–10 user-selected US large-cap tickers (config, not hardcoded).
+- Fuses three evidence streams — technicals, news, curated social sentiment — into a
+  per-ticker conviction score in [−100, +100] with confidence in [0, 1].
+- Converts conviction into BUY / HOLD / TRIM / SELL decisions, sized by a user-set
+  **Risk Factor (1–10)** per the exact mapping table in spec §6.
+- Executes on **Alpaca paper trading only**. Live trading is out of scope for this
+  codebase phase — see Non-negotiables.
+
+## Non-negotiables (enforce in code, never as config)
+1. `TRADING_MODE` is `DRY_RUN` by default. The `LIVE` code path must raise
+   `NotImplementedError` until the go-live gate in spec §10 is met. Do not build the
+   live path even if asked casually mid-session; require an explicit task referencing
+   spec §10 acceptance criteria.
+2. Hard breakers exist regardless of Risk Factor: −3% daily equity → cancel all, halt,
+   alert; −12% from high-water mark → lock to DRY_RUN, require manual unlock file/flag.
+3. Every order passes sanity checks: price collar (±3% of last), max share count,
+   max notional, duplicate-order guard (idempotency key), market-hours check.
+4. Bracket orders only: every entry carries a broker-side stop. No naked positions.
+5. Kill switch endpoint (`POST /system/kill`): cancel all open orders, set halt flag.
+   Must work even if the signal engine is down (separate process/route).
+6. Every decision — including skips — is written to an append-only `decision_log`
+   table with a full feature snapshot (JSON) and human-readable reasons.
+7. No lookahead anywhere: backtests and features must use point-in-time data;
+   news/social features keyed to ingestion timestamp, not publish claims.
+8. Secrets only via environment variables / `.env` (gitignored). Never print keys.
+   Ship `.env.example` with every new secret introduced.
+
+## Tech stack (fixed — don't substitute without asking)
+- Python 3.12, FastAPI, SQLAlchemy 2.x, TimescaleDB (Postgres 16), Redis
+- LightGBM for the technical model; HuggingFace `ProsusAI/finbert` for sentiment;
+  Anthropic API (claude-sonnet-4-6) for news event classification (spec §5B)
+- alpaca-py SDK (paper endpoint), APScheduler for market-hours scheduling
+- React + Vite + Recharts frontend; the visual language and layout follow the existing
+  prototype in `frontend/reference/sentinel-dashboard.jsx` (dark harbor palette,
+  Space Grotesk / IBM Plex Mono, risk-dial signature component)
+- Docker Compose for local dev (api, worker, db, redis, frontend)
+- pytest + pytest-asyncio; ruff + mypy (strict on `core/` and `risk/`)
+
+## Repository layout
+```
+sentinel/
+  docs/                    # spec lives here
+  core/                    # domain models, conviction ensemble, config
+  ingestion/               # prices/, news/, social/ adapters (one module per provider)
+  features/                # indicator + NLP feature computation, feature store I/O
+  models/                  # technical model training, walk-forward harness
+  risk/                    # risk factor mapping, breakers, order sanity checks
+  execution/               # alpaca client, bracket orders, kill switch
+  backtest/                # walk-forward backtester, slippage/cost model, reports
+  api/                     # FastAPI routes
+  frontend/                # React app
+  tests/
+```
+
+## Data providers (adapters behind interfaces; mock in tests)
+- Prices: Alpaca Market Data (primary), yfinance (backfill only)
+- News: Finnhub `/company-news`; SEC EDGAR full-text (8-K, 10-Q, Form 4)
+- Social: Reddit via PRAW (tracked users + ticker subreddits), StockTwits public API,
+  X API v2 behind a feature flag (may be disabled — the system must degrade gracefully
+  and re-normalize ensemble weights when a stream is absent, spec §5)
+- Tracked social authors carry a rolling hit-rate ledger (spec §4.3): log each
+  directional call, score at +5/+20 trading days, weight = f(hit rate, n, recency).
+
+## Build order (work phase by phase; don't jump ahead)
+- **Phase 0:** repo scaffold, Docker Compose, config system, DB migrations,
+  price ingestion + 5y backfill, `/health` and `/watchlist` endpoints, minimal
+  frontend showing live watchlist. DoD: `docker compose up` → dashboard shows real
+  prices for the configured tickers; tests green in CI.
+- **Phase 1:** indicators, LightGBM walk-forward training, backtester with
+  costs/slippage, risk manager + breakers, paper execution loop with bracket orders.
+  DoD: reproducible backtest report (CAGR, Sharpe, max DD, win rate vs. basket
+  buy-and-hold and SPY) generated by one CLI command; breaker unit tests prove halts.
+- **Phase 2:** news + social ingestion, FinBERT + Claude event classification,
+  tracker hit-rate ledger, full ensemble, decision log UI, sentiment desk, alerts.
+  DoD: end-to-end dry-run tick produces a logged, explained decision for each ticker.
+- **Phase 3:** dry-run hardening — uptime monitoring, daily report email/Telegram,
+  attribution dashboards. No live trading work.
+
+## Working style
+- Small PR-sized changes; every change ships with tests. `risk/` and `execution/`
+  require ≥90% branch coverage — a sizing or breaker bug is a money bug.
+- Type hints everywhere; pydantic models at all I/O boundaries.
+- Prefer boring, debuggable code over clever code. No async where sync + queue works.
+- When a provider's API shape is uncertain, write the adapter against a typed
+  interface + fixture data first, verify against the real docs, then integrate.
+- After completing a task: run tests, run ruff + mypy, summarize what changed and
+  what's next in `docs/PROGRESS.md`.
+- If a task is ambiguous or conflicts with the spec or these rules, stop and ask.

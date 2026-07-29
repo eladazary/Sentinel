@@ -23,6 +23,8 @@ from sentinel.execution.sim_broker import SimBroker
 from sentinel.features.engineering import FEATURE_COLUMNS
 
 ET = ZoneInfo("America/New_York")
+# Saturday: market shut, so the entry window is closed at every hour.
+SATURDAY = datetime(2026, 7, 25, 12, 0, tzinfo=ET)
 
 
 # ---- broker factory ----
@@ -151,15 +153,17 @@ def _feature_frame():
     return pd.DataFrame(data, index=idx)
 
 
-def _quote(price, age_seconds=0.0, source="alpaca"):
+def _quote(price, age_seconds=0.0, source="alpaca", as_of=None):
     """A LatestPrice-shaped row.
 
     Entries require a quote that is both fresh and from a real-time feed, so the
-    source matters as much as the age.
+    source matters as much as the age. ``as_of`` must match the ``now`` handed to
+    run_cycle, or the computed age is nonsense (negative ages read as fresh).
     """
+    base = as_of or datetime.now(timezone.utc)
     return SimpleNamespace(
         price=price,
-        updated_at=datetime.now(timezone.utc) - timedelta(seconds=age_seconds),
+        updated_at=base - timedelta(seconds=age_seconds),
         source=source,
     )
 
@@ -387,3 +391,54 @@ def test_a_still_viable_resting_buy_is_left_alone():
         _settings(),
     )
     assert cancelled == [] and freed == set()
+
+
+def test_out_of_window_skip_still_reports_the_real_blocker(patched_loop, monkeypatch):
+    """The window check used to run first and mask everything downstream.
+
+    Outside 10:00-15:30 every symbol logged "outside entry window" and nothing
+    else, so a stale quote or blocked sizing stayed invisible until the next
+    session — when there was no time left to fix it.
+    """
+    reasons = []
+    monkeypatch.setattr(
+        loop_mod.dlog, "log_decision",
+        lambda session, **kw: reasons.append(kw["reason"]),
+    )
+    monkeypatch.setattr(
+        loop_mod, "get_latest_prices",
+        lambda s, syms: {"AAA": _quote(100.0, age_seconds=9_999, as_of=SATURDAY)},
+    )
+    saturday = SATURDAY  # outside the window
+    loop_mod.run_cycle(
+        session_factory=_fake_session, settings=_settings(), watchlist=_watchlist(),
+        broker=SimBroker(cash=100_000), model=FakeModel(0.95),
+        enforce_entry_window=True, now=saturday,
+    )
+    # The quote problem must surface, not be hidden behind the window.
+    assert any("old" in r for r in reasons), reasons
+    assert not any("entry window" in r for r in reasons), reasons
+
+
+def test_out_of_window_skip_says_ready_when_nothing_else_blocks(patched_loop, monkeypatch):
+    """With every other gate passed, the window message should be actionable."""
+    reasons = []
+    monkeypatch.setattr(
+        loop_mod.dlog, "log_decision",
+        lambda session, **kw: reasons.append(kw["reason"]),
+    )
+    saturday = SATURDAY
+    monkeypatch.setattr(
+        loop_mod, "get_latest_prices",
+        lambda s, syms: {"AAA": _quote(100.0, as_of=SATURDAY)},
+    )
+    broker = SimBroker(cash=100_000)
+    loop_mod.run_cycle(
+        session_factory=_fake_session, settings=_settings(), watchlist=_watchlist(),
+        broker=broker, model=FakeModel(0.95),
+        enforce_entry_window=True, now=saturday,
+    )
+    ready = [r for r in reasons if "entry window" in r]
+    assert ready, reasons
+    assert "ready to buy" in ready[0] and "stop" in ready[0]
+    assert "AAA" not in broker.get_positions()  # still didn't trade

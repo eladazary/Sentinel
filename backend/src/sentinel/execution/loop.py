@@ -368,13 +368,13 @@ def run_cycle(
                 )
                 report.add(symbol, "SKIP", "below gate")
                 continue
-            if enforce_entry_window and not in_entry_window(now):
-                dlog.log_decision(
-                    session, ts=now, symbol=symbol, action="SKIP", signal=signal,
-                    reason="outside 10:00–15:30 ET entry window", **common,
-                )
-                report.add(symbol, "SKIP", "outside entry window")
-                continue
+            # NOTE: the entry-window check deliberately comes *last*, just before
+            # submission. It used to sit here, which meant that outside 10:00–15:30
+            # every symbol logged "outside entry window" and nothing else — masking
+            # stale quotes, blocked sizing and duplicate orders until the next
+            # session, when there was no time left to fix them. Every check below
+            # is pure computation with no side effects, so running it out of hours
+            # costs nothing and turns the log into a pre-flight report.
             if new_today >= profile.max_new_positions_per_day:
                 dlog.log_decision(
                     session, ts=now, symbol=symbol, action="SKIP", signal=signal,
@@ -450,6 +450,21 @@ def run_cycle(
                     sizing=_sizing_dict(sizing), **common,
                 )
                 report.add(symbol, "SKIP", chk.reason)
+                continue
+
+            # Last gate: everything above passed, so this is genuinely "ready, but
+            # the market isn't open for entries yet" — and the log now says so.
+            if enforce_entry_window and not in_entry_window(now):
+                dlog.log_decision(
+                    session, ts=now, symbol=symbol, action="SKIP", signal=signal,
+                    reason=(
+                        f"ready to buy {sizing.shares}@~{limit_price:.2f} "
+                        f"(stop {sizing.stop_price:.2f}) — waiting for the "
+                        f"10:00–15:30 ET entry window"
+                    ),
+                    sizing=_sizing_dict(sizing), **common,
+                )
+                report.add(symbol, "SKIP", "outside entry window")
                 continue
 
             try:
