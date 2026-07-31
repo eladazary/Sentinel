@@ -82,6 +82,16 @@ class SimBroker:
         self.fills.append(res)
         return res
 
+    def submit_protection(
+        self, symbol: str, qty: int, stop_price: float, take_profit: float
+    ) -> OrderResult:
+        """The sim tracks levels on the position itself, so just refresh them."""
+        pos = self.positions.get(symbol)
+        if pos is not None:
+            pos.stop, pos.take_profit = stop_price, take_profit
+        oid = f"sim-{next(self._ids)}"
+        return OrderResult(oid, symbol, qty, "sell", "held")
+
     def close_position(self, symbol: str) -> OrderResult | None:
         pos = self.positions.pop(symbol, None)
         if pos is None:

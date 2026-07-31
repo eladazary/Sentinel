@@ -76,6 +76,17 @@ class Broker(Protocol):
         take_profit: float,
     ) -> OrderResult: ...
 
+    def submit_protection(
+        self, symbol: str, qty: int, stop_price: float, take_profit: float
+    ) -> OrderResult:
+        """Attach a stop + target to a position that already exists.
+
+        Needed because a bracket's legs can be cancelled or expire independently
+        of the position, leaving it naked. Spec §4 requires a live broker-side
+        stop for every holding, so something has to be able to restore one.
+        """
+        ...
+
     def close_position(self, symbol: str) -> OrderResult | None: ...
 
     def cancel_order(self, order_id: str) -> bool:

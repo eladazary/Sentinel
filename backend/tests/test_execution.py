@@ -19,6 +19,7 @@ from sentinel.execution.factory import (
     reset_broker_cache,
 )
 from sentinel.execution.scheduler import in_entry_window, is_market_open
+from sentinel.risk.profile import risk_profile
 from sentinel.execution.sim_broker import SimBroker
 from sentinel.features.engineering import FEATURE_COLUMNS
 
@@ -442,3 +443,104 @@ def test_out_of_window_skip_says_ready_when_nothing_else_blocks(patched_loop, mo
     assert ready, reasons
     assert "ready to buy" in ready[0] and "stop" in ready[0]
     assert "AAA" not in broker.get_positions()  # still didn't trade
+
+
+# ---- spec §4: no naked positions ----
+
+class _ProtectionBroker(SimBroker):
+    """Tracks protection calls and lets a test pretend legs went missing."""
+
+    def __init__(self, *a, working=(), **kw):
+        super().__init__(*a, **kw)
+        self._working = list(working)
+        self.protected = []
+
+    def open_orders(self):
+        return list(self._working)
+
+    def submit_protection(self, symbol, qty, stop_price, take_profit):
+        self.protected.append((symbol, qty, stop_price, take_profit))
+        from sentinel.execution.broker import OrderResult
+        return OrderResult("p1", symbol, qty, "sell", "held")
+
+
+def _held(symbol="AAA", qty=39, entry=305.24):
+    from sentinel.execution.broker import BrokerPosition
+    return {symbol: BrokerPosition(symbol, qty, entry, qty * entry)}
+
+
+def test_unprotected_position_gets_a_stop_restored(monkeypatch):
+    """A DAY bracket's legs expire at the close, leaving the position naked."""
+    from sentinel.execution import loop as lm
+
+    monkeypatch.setattr(lm, "_entry_levels", lambda s, sym: (286.90, 342.72))
+    broker = _ProtectionBroker(cash=100_000)  # no working sell orders
+    logged = []
+    monkeypatch.setattr(lm.dlog, "log_decision", lambda s, **kw: logged.append(kw))
+
+    restored = lm._ensure_protection(
+        object(), broker, _held(), risk_profile(7), datetime.now(timezone.utc)
+    )
+    assert restored == ["AAA"]
+    assert broker.protected == [("AAA", 39, 286.90, 342.72)]
+    assert logged and logged[0]["action"] == "PROTECT"
+
+
+def test_already_protected_position_is_left_alone(monkeypatch):
+    from sentinel.execution import loop as lm
+    from sentinel.execution.broker import WorkingOrder
+
+    monkeypatch.setattr(lm, "_entry_levels", lambda s, sym: (286.90, 342.72))
+    live = WorkingOrder(id="o1", symbol="AAA", qty=39, side="sell",
+                        status="held", limit_price=342.72)
+    broker = _ProtectionBroker(cash=100_000, working=[live])
+
+    restored = lm._ensure_protection(
+        object(), broker, _held(), risk_profile(7), datetime.now(timezone.utc)
+    )
+    assert restored == [] and broker.protected == []
+
+
+def test_restored_levels_come_from_the_original_entry_decision(monkeypatch):
+    """Not a fresh guess — the levels the system actually chose at entry."""
+    from sentinel.execution import loop as lm
+
+    monkeypatch.setattr(lm, "_entry_levels", lambda s, sym: (111.11, 222.22))
+    broker = _ProtectionBroker(cash=100_000)
+    monkeypatch.setattr(lm.dlog, "log_decision", lambda s, **kw: None)
+
+    lm._ensure_protection(object(), broker, _held(), risk_profile(7),
+                          datetime.now(timezone.utc))
+    assert broker.protected[0][2:] == (111.11, 222.22)
+
+
+def test_missing_entry_decision_still_yields_protection(monkeypatch):
+    """Better a profile-derived stop than a naked position."""
+    from sentinel.execution import loop as lm
+
+    monkeypatch.setattr(lm, "_entry_levels", lambda s, sym: None)
+    broker = _ProtectionBroker(cash=100_000)
+    monkeypatch.setattr(lm.dlog, "log_decision", lambda s, **kw: None)
+
+    restored = lm._ensure_protection(
+        object(), broker, _held(), risk_profile(7), datetime.now(timezone.utc)
+    )
+    assert restored == ["AAA"]
+    symbol, qty, stop, target = broker.protected[0]
+    assert stop < 305.24 < target  # brackets the entry
+
+
+def test_broker_failure_during_restore_does_not_kill_the_cycle(monkeypatch):
+    from sentinel.execution import loop as lm
+
+    monkeypatch.setattr(lm, "_entry_levels", lambda s, sym: (286.90, 342.72))
+
+    class Failing(_ProtectionBroker):
+        def submit_protection(self, *a, **kw):
+            raise RuntimeError("broker down")
+
+    restored = lm._ensure_protection(
+        object(), Failing(cash=100_000), _held(), risk_profile(7),
+        datetime.now(timezone.utc),
+    )
+    assert restored == []  # reported, not raised

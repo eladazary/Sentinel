@@ -25,7 +25,7 @@ from sentinel.features.dataset import build_symbol_features, load_bars
 from sentinel.features.engineering import FEATURE_COLUMNS
 from sentinel.logging_config import get_logger
 from sentinel.model.technical import TechnicalModel
-from sentinel.models import EquitySnapshot
+from sentinel.models import Decision, EquitySnapshot
 from sentinel.news.earnings import is_in_blackout
 from sentinel.ingestion.prices import REALTIME_QUOTE_SOURCES
 from sentinel.repositories import get_latest_prices, get_sentiment_cache
@@ -194,6 +194,92 @@ def _cancel_unfillable_buys(
     return freed
 
 
+def _ensure_protection(
+    session: Session,
+    broker: Broker,
+    positions: dict,
+    profile,
+    now: datetime,
+) -> list[str]:
+    """Restore a broker-side stop for any holding that has lost one.
+
+    Spec §4 requires every position to carry a stop at the broker. A bracket
+    satisfies that at entry and then quietly stops: legs can be cancelled, and a
+    DAY bracket takes them down at the close — which left two positions naked
+    over a weekend on 2026-07-31. Brackets are GTC now, but a leg can still go
+    missing, so the invariant is enforced here rather than assumed.
+
+    Levels come from the position's own OPEN decision, so restored protection
+    matches what the system originally chose rather than a fresh guess.
+    """
+    submit = getattr(broker, "submit_protection", None)
+    orders = getattr(broker, "open_orders", None)
+    if submit is None or orders is None or not positions:
+        return []
+
+    try:
+        working = orders()
+    except Exception:  # noqa: BLE001 - never fail a cycle on a broker read
+        log.warning("could not list working orders; skipping protection check",
+                    exc_info=True)
+        return []
+
+    protected = {o.symbol for o in working if o.side == "sell"}
+    restored: list[str] = []
+    for symbol, pos in positions.items():
+        if symbol in protected or pos.qty <= 0:
+            continue
+        levels = _entry_levels(session, symbol)
+        if levels is None:
+            # Fall back to the risk profile's stop width off the average entry,
+            # so an unprotected position is never left unprotected.
+            stop = round(pos.avg_entry * (1 - profile.stop_atr_mult / 100.0), 2)
+            target = round(pos.avg_entry * (1 + 2 * profile.stop_atr_mult / 100.0), 2)
+            log.warning(
+                "%s has no OPEN decision to read levels from; using profile "
+                "defaults stop %.2f / target %.2f", symbol, stop, target,
+            )
+        else:
+            stop, target = levels
+        try:
+            submit(symbol, pos.qty, stop, target)
+        except Exception:  # noqa: BLE001 - report and keep going
+            log.exception("could not restore protection for %s", symbol)
+            continue
+        restored.append(symbol)
+        log.warning(
+            "restored missing protection for %s: %d sh, stop %.2f, target %.2f",
+            symbol, pos.qty, stop, target,
+        )
+        dlog.log_decision(
+            session, ts=now, symbol=symbol, action="PROTECT", signal="HOLD",
+            conviction=0.0, confidence=0.0, risk_factor=profile.risk_factor,
+            mode="DRY_RUN",
+            reason=(
+                f"position had no broker-side stop — restored "
+                f"stop {stop:.2f} / target {target:.2f}"
+            ),
+            drivers=["spec §4: no naked positions"],
+            sizing={"shares": pos.qty, "stop": stop, "take_profit": target},
+        )
+    return restored
+
+
+def _entry_levels(session: Session, symbol: str) -> tuple[float, float] | None:
+    """Stop and target from the most recent OPEN decision for this symbol."""
+    row = session.execute(
+        select(Decision)
+        .where(Decision.symbol == symbol, Decision.action == "OPEN")
+        .order_by(Decision.ts.desc(), Decision.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    sizing = (row.sizing or {}) if row is not None else {}
+    stop, target = sizing.get("stop"), sizing.get("take_profit")
+    if stop is None or target is None:
+        return None
+    return float(stop), float(target)
+
+
 def run_cycle(
     *,
     session_factory: SessionFactory,
@@ -266,6 +352,11 @@ def run_cycle(
             if notifier is not None:
                 notifier.breaker(reason)
             return report
+
+        # Enforce spec §4 before anything else touches the book: a holding
+        # without a stop is the one state that must never persist a cycle.
+        for symbol in _ensure_protection(session, broker, positions, profile, now):
+            report.add(symbol, "PROTECT", "restored missing stop")
 
         sentiment = get_sentiment_cache(session, watchlist.symbols)
         new_today = 0

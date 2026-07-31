@@ -92,7 +92,11 @@ class AlpacaBroker:
             symbol=symbol,
             qty=qty,
             side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
+            # GTC, not DAY. A DAY bracket takes its protective legs down with it
+            # at the close, so a multi-day swing position spent every night naked
+            # — silently violating spec §4. A resting *entry* also persists now,
+            # which _cancel_unfillable_buys re-prices each cycle.
+            time_in_force=TimeInForce.GTC,
             limit_price=round(limit_price, 2),
             order_class=OrderClass.BRACKET,
             take_profit=TakeProfitRequest(limit_price=round(take_profit, 2)),
@@ -101,6 +105,25 @@ class AlpacaBroker:
         o = self._client.submit_order(req)
         return OrderResult(
             id=str(o.id), symbol=symbol, qty=qty, side="buy", status=str(o.status)
+        )
+
+    def submit_protection(
+        self, symbol: str, qty: int, stop_price: float, take_profit: float
+    ) -> OrderResult:
+        """GTC one-cancels-other: whichever side hits first closes the position."""
+        req = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            order_class=OrderClass.OCO,
+            limit_price=round(take_profit, 2),
+            take_profit=TakeProfitRequest(limit_price=round(take_profit, 2)),
+            stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+        )
+        o = self._client.submit_order(req)
+        return OrderResult(
+            id=str(o.id), symbol=symbol, qty=qty, side="sell", status=str(o.status)
         )
 
     def close_position(self, symbol: str) -> OrderResult | None:
