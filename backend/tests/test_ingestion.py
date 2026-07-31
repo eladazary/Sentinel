@@ -316,3 +316,69 @@ def test_delayed_feed_cannot_price_an_entry():
 
     unknown = Quote(price=100.0, age_seconds=1.0)
     assert unknown.usable_for_entry(300.0) is not None
+
+
+# ---- one bad symbol must not zero every quote ----
+
+def _md(supports_index, bad=()):
+    from datetime import datetime, timezone
+
+    class _MD:
+        supports_index_symbols = supports_index
+
+        def get_latest_prices(self, symbols):
+            offenders = [s for s in symbols if s in bad]
+            if offenders:  # Alpaca 400s the whole batch, not just the offender
+                raise RuntimeError(f"400 Bad Request for {offenders}")
+            return {s: (1.0, datetime.now(timezone.utc)) for s in symbols}
+
+    return _MD()
+
+
+def test_index_symbols_are_dropped_for_feeds_that_reject_them():
+    """^VIX 400'd Alpaca's whole batch, silently zeroing every watchlist quote."""
+    from sentinel.ingestion.prices import _quote_eligible
+
+    syms = ["NVDA", "SPY", "^VIX"]
+    assert _quote_eligible(_md(False), syms) == ["NVDA", "SPY"]
+    assert _quote_eligible(_md(True), syms) == syms  # yfinance serves indices
+
+
+def test_a_rejected_symbol_no_longer_costs_the_others_their_quotes(monkeypatch):
+    from contextlib import contextmanager
+
+    from sentinel.ingestion import prices as prices_mod
+
+    saved = {}
+
+    @contextmanager
+    def fake_session():
+        yield object()
+
+    monkeypatch.setattr(
+        prices_mod.repo, "upsert_latest_price",
+        lambda session, symbol, price, ts, updated_at, source="alpaca": saved.setdefault(symbol, price),
+    )
+    n = prices_mod.ingest_latest_prices(
+        _md(True, bad=("BADSYM",)),
+        ["NVDA", "BADSYM", "AAPL"],
+        session_factory=fake_session,
+        source="alpaca",
+    )
+    # The good ones still land; only the offender is lost.
+    assert n == 2
+    assert set(saved) == {"NVDA", "AAPL"}
+
+
+def test_ingest_returns_zero_when_nothing_is_eligible(monkeypatch):
+    from contextlib import contextmanager
+
+    from sentinel.ingestion import prices as prices_mod
+
+    @contextmanager
+    def fake_session():
+        yield object()
+
+    assert prices_mod.ingest_latest_prices(
+        _md(False), ["^VIX"], session_factory=fake_session
+    ) == 0

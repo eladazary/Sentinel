@@ -30,6 +30,43 @@ def _check_redis() -> HealthComponent:
     )
 
 
+def _check_worker() -> HealthComponent:
+    """Report how long since the worker last completed a cycle.
+
+    A wedged worker is invisible from the outside: the container stays "healthy"
+    and the process is alive, so the only symptom is that nothing gets written.
+    The heartbeat existed for exactly this and nothing was reading it.
+    """
+    from datetime import datetime, timezone
+
+    from sentinel.redis_client import get_redis
+
+    try:
+        raw = get_redis().get("sentinel:worker:heartbeat")
+        status = get_redis().get("sentinel:worker:status")
+    except Exception as exc:  # noqa: BLE001 - report, don't raise
+        return HealthComponent(name="worker", ok=False, detail=f"redis: {exc}")
+
+    if not raw:
+        return HealthComponent(
+            name="worker", ok=False, detail="no heartbeat recorded yet"
+        )
+    beat = datetime.fromisoformat(raw.decode() if isinstance(raw, bytes) else raw)
+    age = (datetime.now(timezone.utc) - beat).total_seconds()
+    state = (status.decode() if isinstance(status, bytes) else status) or "unknown"
+    # Generous: the interval is 60s and a slow sentiment refresh legitimately
+    # takes minutes. Past this, it isn't slow — it's stuck.
+    stale = age > 600
+    return HealthComponent(
+        name="worker",
+        ok=not stale,
+        detail=(
+            f"last cycle {age:.0f}s ago ({state})"
+            + (" — WEDGED or stopped" if stale else "")
+        ),
+    )
+
+
 def _check_broker() -> HealthComponent:
     """Report the broker without gating liveness.
 
@@ -60,5 +97,5 @@ def health(response: Response) -> HealthResponse:
         status="ok" if all_ok else "degraded",
         mode=settings.mode,
         version=__version__,
-        components=[*gating, _check_broker()],
+        components=[*gating, _check_broker(), _check_worker()],
     )

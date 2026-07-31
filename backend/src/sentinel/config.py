@@ -197,6 +197,18 @@ class Settings(BaseSettings):
     # something without keys.
     quote_source: str = "auto"
 
+    # --- worker liveness ---
+    # Per-stage budgets. A blocking call without a socket timeout (alpaca-py
+    # drives requests without one) otherwise stops the desk silently: the
+    # container stays "healthy" and the only symptom is that nothing is written.
+    stage_timeout_seconds: float = Field(default=120.0, ge=0)
+    # Sentiment is the slow one: FinBERT inference plus EDGAR and social fetches
+    # across the whole watchlist.
+    sentiment_timeout_seconds: float = Field(default=300.0, ge=0)
+    # Backstop for a hang SIGALRM can't interrupt: exit and let Docker restart.
+    # Must exceed the slowest stage or it will fire on a merely slow cycle.
+    worker_hard_timeout_seconds: float = Field(default=900.0, ge=0)
+
     # --- entry execution ---
     # How far above the live quote a marketable buy limit is placed. Big enough
     # to cross a normal spread, small enough to bound the worst fill. Entries

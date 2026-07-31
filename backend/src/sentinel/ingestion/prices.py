@@ -106,6 +106,52 @@ def backfill_prices(
     )
 
 
+def _quote_eligible(md: MarketData, symbols: list[str]) -> list[str]:
+    """Drop symbols this feed cannot serve.
+
+    Index symbols like ``^VIX`` are not tradable instruments, and Alpaca's
+    stock-trades endpoint answers 400 for the *entire batch* when one is present
+    — so a single index symbol silently zeroed every quote in the watchlist.
+    Indices are only needed as regime features off daily bars, never as quotes.
+    """
+    if getattr(md, "supports_index_symbols", True):
+        return list(symbols)
+    keep = [s for s in symbols if not s.startswith("^")]
+    dropped = sorted(set(symbols) - set(keep))
+    if dropped:
+        log.debug("quote feed cannot serve index symbols, skipping: %s",
+                  ", ".join(dropped))
+    return keep
+
+
+def _fetch_quotes(
+    md: MarketData, symbols: list[str]
+) -> dict[str, tuple[float, datetime]]:
+    """Batched fetch, falling back to per-symbol so one bad name isn't fatal.
+
+    The batch is one request and therefore all-or-nothing: any rejected symbol
+    used to cost every other symbol its quote, which then read downstream as
+    "no quote recorded" with no hint that the rest were fine.
+    """
+    try:
+        return md.get_latest_prices(symbols)
+    except Exception as exc:  # noqa: BLE001 - fall back rather than lose them all
+        log.warning(
+            "batched quote request failed (%s) — retrying symbol by symbol", exc
+        )
+
+    out: dict[str, tuple[float, datetime]] = {}
+    bad: list[str] = []
+    for symbol in symbols:
+        try:
+            out.update(md.get_latest_prices([symbol]))
+        except Exception:  # noqa: BLE001 - isolate the offender
+            bad.append(symbol)
+    if bad:
+        log.error("quote feed rejected these symbols: %s", ", ".join(bad))
+    return out
+
+
 def ingest_latest_prices(
     md: MarketData,
     symbols: list[str],
@@ -118,7 +164,11 @@ def ingest_latest_prices(
     if not symbols:
         return 0
     observed_at = now or _utcnow()
-    prices = md.get_latest_prices(symbols)
+
+    wanted = _quote_eligible(md, symbols)
+    if not wanted:
+        return 0
+    prices = _fetch_quotes(md, wanted)
     updated = 0
     with session_factory() as session:
         for symbol, (price, ts) in prices.items():

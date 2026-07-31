@@ -50,6 +50,8 @@ def _frame_to_rows(symbol: str, df: pd.DataFrame) -> list[dict]:
 
 
 class YFinanceMarketData:
+    supports_index_symbols = True  # yfinance serves ^VIX and friends
+
     """Historical + latest daily prices via yfinance (auto-adjusted)."""
 
     def get_daily_bars(

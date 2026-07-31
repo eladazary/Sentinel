@@ -49,6 +49,10 @@ def normalize_bar(symbol: str, bar: BarLike) -> dict:
 
 
 class AlpacaMarketData:
+    # The stock-trades endpoint only knows tradable instruments. Asking it for
+    # an index like ^VIX returns 400 for the WHOLE batch, zeroing every quote.
+    supports_index_symbols = False
+
     """Historical + latest price access over Alpaca's market-data API."""
 
     def __init__(self, api_key: str, secret_key: str, feed: str = "iex") -> None:

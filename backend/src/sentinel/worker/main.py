@@ -32,6 +32,7 @@ from sentinel.nlp.sentiment import make_sentiment_scorer
 from sentinel.redis_client import get_redis
 from sentinel.sentiment_jobs import refresh_sentiment
 from sentinel.universe import load_universe, mark_backfilled, pending_backfill
+from sentinel.worker.watchdog import HardWatchdog, StageTimeout, time_limit
 
 log = get_logger("sentinel.worker")
 
@@ -150,12 +151,22 @@ def run() -> None:
         "entering loop (every %ds): ingest prices → [sentiment] → signals → paper cycle",
         settings.ingest_interval_seconds,
     )
+    # Every stage below is wrapped in a budget. Without this a single call that
+    # never returns wedges the loop indefinitely while the container still looks
+    # healthy — the failure mode that cost several sessions.
+    watchdog = HardWatchdog(settings.worker_hard_timeout_seconds)
+    watchdog.start()
+    stage_budget = settings.stage_timeout_seconds
+
     was_open: bool | None = None
     while _running:
         # Pick up tickers added through the API, and give each one its price
         # history before the model is asked to score it.
         try:
-            watchlist, symbols = _sync_universe(settings, md, watchlist, symbols)
+            with time_limit(stage_budget, "universe sync"):
+                watchlist, symbols = _sync_universe(settings, md, watchlist, symbols)
+        except StageTimeout as exc:
+            log.error("%s — skipping to the next stage", exc)
         except Exception:  # noqa: BLE001 - keep the loop alive
             log.exception("universe sync failed")
 
@@ -172,7 +183,10 @@ def run() -> None:
 
         if market_open:
             try:
-                ingest_latest_prices(quote_md, symbols, source=quote_name)
+                with time_limit(stage_budget, "price ingest"):
+                    ingest_latest_prices(quote_md, symbols, source=quote_name)
+            except StageTimeout as exc:
+                log.error("%s — quotes will be stale this cycle", exc)
             except Exception:  # noqa: BLE001 - keep the loop alive
                 log.exception("latest-price ingestion failed")
 
@@ -180,11 +194,14 @@ def run() -> None:
         # outside session hours, and weekends are when chatter peaks.
         if cycle_count % refresh_every == 0:
             try:
-                refresh_sentiment(
-                    session_factory=session_scope, settings=settings,
-                    watchlist=watchlist, sentiment=sentiment_scorer,
-                    classifier=event_classifier,
-                )
+                with time_limit(settings.sentiment_timeout_seconds, "sentiment refresh"):
+                    refresh_sentiment(
+                        session_factory=session_scope, settings=settings,
+                        watchlist=watchlist, sentiment=sentiment_scorer,
+                        classifier=event_classifier,
+                    )
+            except StageTimeout as exc:
+                log.error("%s — carrying the previous sentiment forward", exc)
             except Exception:  # noqa: BLE001
                 log.exception("sentiment refresh failed")
 
@@ -192,22 +209,29 @@ def run() -> None:
             _heartbeat("ok:market-closed")
         elif model is not None:
             try:
-                report = run_cycle(
-                    session_factory=session_scope,
-                    settings=settings,
-                    watchlist=watchlist,
-                    broker=broker,
-                    model=model,
-                    enforce_entry_window=True,  # no off-hours order placement
-                    notifier=notifier,
-                )
+                with time_limit(stage_budget, "trading cycle"):
+                    report = run_cycle(
+                        session_factory=session_scope,
+                        settings=settings,
+                        watchlist=watchlist,
+                        broker=broker,
+                        model=model,
+                        enforce_entry_window=True,  # no off-hours order placement
+                        notifier=notifier,
+                    )
                 _heartbeat(f"ok:{len(report.actions)} decisions")
+            except StageTimeout as exc:
+                log.error("%s", exc)
+                _heartbeat("error:cycle-timeout")
             except Exception:  # noqa: BLE001
                 log.exception("trading cycle failed")
                 _heartbeat("error:cycle")
         else:
             _heartbeat("ok:no-model (run sentinel-train)")
 
+        # Progress made: the loop reached the end of an iteration, whatever
+        # each stage decided. Only a genuine wedge stops this.
+        watchdog.beat()
         cycle_count += 1
         for _ in range(settings.ingest_interval_seconds):
             if not _running:
