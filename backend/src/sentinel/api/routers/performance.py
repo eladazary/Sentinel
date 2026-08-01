@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from sentinel.api.deps import get_db, settings_dep
-from sentinel.config import Settings
+from sentinel.config import Settings, get_settings
+from sentinel.logging_config import get_logger
 from sentinel.models import DailyBar, Decision, EquitySnapshot
 from sentinel.schemas import PerformancePoint, PerformanceResponse, PerformanceSummary
 
 router = APIRouter(tags=["performance"])
+
+log = get_logger(__name__)
 
 
 @router.get("/performance", response_model=PerformanceResponse)
@@ -68,6 +73,24 @@ def performance(
     )
 
 
+def _broker_equity() -> tuple[float | None, str, datetime | None]:
+    """Live equity from the venue, or (None, ...) if it can't be trusted.
+
+    Refuses a degraded broker: the in-memory sim reports a pristine 100k that
+    would read as "your money is fine" while the real account is unreachable.
+    """
+    from sentinel.execution.factory import make_broker_with_status
+
+    try:
+        broker, status = make_broker_with_status(get_settings())
+        if status.degraded or status.broker != "alpaca":
+            return None, "", None
+        return float(broker.get_account().equity), "broker", datetime.now(timezone.utc)
+    except Exception:  # noqa: BLE001 - fall back to the ledger, never fail the view
+        log.warning("could not read live equity from the broker", exc_info=True)
+        return None, "", None
+
+
 def _summarize(
     db: Session,
     settings: Settings,
@@ -88,9 +111,20 @@ def _summarize(
     live_rows = [s for s in snaps if s.source == "live"]
     replay_rows = [s for s in snaps if s.source == "replay"]
 
-    # No forward rows yet: report the baseline rather than borrowing the
-    # replay's closing equity, which was never real money.
-    equity = float(live_rows[-1].equity) if live_rows else start
+    # Prefer the broker. The ledger is only as current as the last cycle the
+    # *local* worker completed, so a stopped worker — or a second machine sharing
+    # one Alpaca account but keeping its own database — reported $100,000 and
+    # 0.00% while real positions were open at the venue. The venue is the truth
+    # about money; the ledger is this machine's record of it.
+    equity, equity_source, as_of = _broker_equity()
+    if equity is None:
+        if live_rows:
+            equity, equity_source = float(live_rows[-1].equity), "ledger"
+            as_of = live_rows[-1].ts
+        else:
+            # Neither the venue nor a forward row: say baseline rather than
+            # borrow the replay's closing equity, which was never real money.
+            equity, equity_source, as_of = start, "baseline", None
     pnl = equity - start
 
     def endpoint_return(rows: list[EquitySnapshot]) -> float | None:
@@ -130,6 +164,7 @@ def _summarize(
         benchmark_return_pct=benchmark,
         replay_return_pct=round(replay_ret * 100.0, 3) if replay_ret is not None else None,
         positions_opened=int(opened),
-        as_of=live_rows[-1].ts if live_rows else None,
+        as_of=as_of,
+        equity_source=equity_source,
         note=note,
     )

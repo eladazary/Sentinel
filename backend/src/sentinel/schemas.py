@@ -213,6 +213,10 @@ class PerformanceSummary(BaseModel):
     replay_return_pct: float | None = None
     positions_opened: int
     as_of: datetime | None = None
+    # "broker" = live from the venue, "ledger" = last cycle this machine
+    # recorded, "baseline" = neither was available. A stopped worker used to
+    # report the baseline as though it were current.
+    equity_source: str = "ledger"
     # Set when nothing has traded, so the UI can explain a flat 0.00%.
     note: str | None = None
 

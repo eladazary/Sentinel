@@ -188,3 +188,68 @@ def test_risk_profile_single(client):
 
 def test_risk_profile_out_of_range(client):
     assert client.get("/risk/profile", params={"risk_factor": 11}).status_code == 422
+
+
+# ---- equity must come from the venue, not a possibly-dead worker ----
+
+def _summary(monkeypatch, broker_equity, live_rows, replay_rows=(99_695.0,)):
+    """Run _summarize with a stubbed broker and a chosen ledger state."""
+    from types import SimpleNamespace
+
+    from sentinel.api.routers import performance as perf
+    from sentinel.config import Settings
+
+    monkeypatch.setattr(
+        perf, "_broker_equity",
+        lambda: (broker_equity, "broker", datetime.now(timezone.utc))
+        if broker_equity is not None else (None, "", None),
+    )
+    # Replay rows are present on any seeded install, so `snaps` is non-empty
+    # even when the local worker has never recorded a forward cycle — which is
+    # exactly the state the second machine was in.
+    snaps = [
+        SimpleNamespace(ts=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                        equity=e, source="replay")
+        for e in replay_rows
+    ] + [
+        SimpleNamespace(ts=datetime(2026, 7, 31, 19, 57, tzinfo=timezone.utc),
+                        equity=e, source="live")
+        for e in live_rows
+    ]
+    db = SimpleNamespace(execute=lambda *a, **k: SimpleNamespace(scalar_one=lambda: 2))
+    points = [
+        perf.PerformancePoint(ts=s.ts, equity=float(s.equity), drawdown_pct=0.0, spy=None)
+        for s in snaps
+    ]
+    return perf._summarize(db, Settings(), snaps, points, lambda ts: None)
+
+
+def test_equity_prefers_the_broker_over_a_stale_ledger(monkeypatch):
+    """The bug: a second machine sharing one Alpaca account reported $100,000
+    and 0.00% while real positions were open at the venue."""
+    s = _summary(monkeypatch, broker_equity=100_205.26, live_rows=[100_000.0])
+    assert s.equity == 100_205.26
+    assert s.equity_source == "broker"
+    assert s.pnl == 205.26 and s.return_pct == 0.205
+
+
+def test_equity_falls_back_to_the_ledger_when_the_broker_is_unreachable(monkeypatch):
+    s = _summary(monkeypatch, broker_equity=None, live_rows=[100_058.25, 100_205.26])
+    assert s.equity == 100_205.26
+    assert s.equity_source == "ledger"
+    assert s.as_of is not None
+
+
+def test_equity_reports_baseline_when_neither_source_exists(monkeypatch):
+    """Must be labelled, not silently presented as current."""
+    s = _summary(monkeypatch, broker_equity=None, live_rows=[])
+    assert s.equity == 100_000.0
+    assert s.equity_source == "baseline"
+    assert s.return_pct == 0.0
+
+
+def test_pnl_and_return_stay_consistent_with_whichever_source_won(monkeypatch):
+    for eq in (100_205.26, 99_500.0):
+        s = _summary(monkeypatch, broker_equity=eq, live_rows=[100_000.0])
+        assert s.pnl == round(eq - 100_000.0, 2)
+        assert s.return_pct == round(s.pnl / 100_000.0 * 100, 3)

@@ -137,6 +137,11 @@ function PerfChart({ perf }) {
           <div className="bl-main">
             <span className="stat-l">Money now</span>
             <span className="bl-eq mono">{fmtMoney(s.equity)}</span>
+            <span className={"stat-src" + (s.equity_source !== "broker" ? " warn" : "")}>
+              {s.equity_source === "broker" ? "live from alpaca"
+                : s.equity_source === "ledger" ? `last cycle · ${dateOf(s.as_of)}`
+                : "baseline — worker never recorded equity"}
+            </span>
           </div>
           <div className="bl-main">
             <span className="stat-l">Return</span>
