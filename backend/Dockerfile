@@ -12,22 +12,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Dependencies resolve from pyproject alone, so this layer survives source edits.
-# The previous version copied src/ *before* installing, which invalidated this
-# layer on every code change and reinstalled the whole tree — torch, transformers,
-# lightgbm — turning a one-line fix into a 40-60 minute build. A stub package
-# satisfies the build backend without needing the real source here.
+# Install dependencies first (declared in pyproject) for better layer caching.
 COPY pyproject.toml ./
-RUN mkdir -p src/sentinel \
-    && touch src/sentinel/__init__.py \
-    && pip install --upgrade pip \
-    && pip install . \
-    && rm -rf src
-
-# Only this layer rebuilds when code changes: seconds, not an hour. --no-deps
-# because the dependency set is already installed and pinned above.
 COPY src ./src
-RUN pip install --no-deps --force-reinstall .
+RUN pip install --upgrade pip && pip install .
 
 # Runtime files needed by the app / migrations.
 COPY alembic.ini ./
