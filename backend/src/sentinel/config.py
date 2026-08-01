@@ -197,6 +197,14 @@ class Settings(BaseSettings):
     # something without keys.
     quote_source: str = "auto"
 
+    # Spec §6 caps new positions per day (1/2/4 at risk 1/5/10). Turning this off
+    # lets every signal that clears the conviction gate through on the same day.
+    # DELIBERATE DEVIATION when false — the remaining limits are max_position_pct
+    # per name, max_exposure_pct in total, and the daily-loss breaker, which
+    # together still bound a bad day: ~5 positions at risk 7, and the 3% breaker
+    # halts trading after roughly one and a half stop-outs.
+    enforce_daily_position_cap: bool = True
+
     # --- worker liveness ---
     # Per-stage budgets. A blocking call without a socket timeout (alpaca-py
     # drives requests without one) otherwise stops the desk silently: the

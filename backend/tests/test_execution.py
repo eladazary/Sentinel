@@ -544,3 +544,128 @@ def test_broker_failure_during_restore_does_not_kill_the_cycle(monkeypatch):
         datetime.now(timezone.utc),
     )
     assert restored == []  # reported, not raised
+
+
+# ---- the daily new-position cap is optional (spec §6 deviation) ----
+
+def _many_names():
+    return Watchlist(tickers=[
+        Ticker(symbol=s, name=s, sector_etf="XLK")
+        for s in ("AAA", "BBB", "CCC", "DDD")
+    ])
+
+
+def _cap_run(monkeypatch, *, risk, enforce, cash=1_000_000):
+    """Four names all screaming BUY. How many get through?
+
+    risk_factor is passed explicitly: run_cycle otherwise reads it from Redis,
+    which on a dev box holds whatever the operator's dial is set to.
+    """
+    monkeypatch.setattr(
+        loop_mod, "get_latest_prices",
+        lambda s, syms: {sym: _quote(100.0) for sym in syms},
+    )
+    broker = SimBroker(cash=cash)
+    broker.set_prices({s: 100.0 for s in ("AAA", "BBB", "CCC", "DDD")})
+    report = loop_mod.run_cycle(
+        session_factory=_fake_session,
+        settings=Settings(enforce_daily_position_cap=enforce),
+        watchlist=_many_names(), broker=broker, model=FakeModel(0.95),
+        enforce_entry_window=False, risk_factor=risk,
+    )
+    opened = [a["symbol"] for a in report.actions if a["action"] == "OPEN"]
+    capped = [a for a in report.actions if a["reason"] == "daily cap reached"]
+    return opened, capped, broker
+
+
+def test_cap_on_binds_at_two_per_day(patched_loop, monkeypatch):
+    opened, capped, _ = _cap_run(monkeypatch, risk=5, enforce=True)
+    assert len(opened) == 2   # risk 5 allows 2/day
+    assert len(capped) == 2   # and the rest say why
+
+
+def test_cap_off_lets_every_qualifying_signal_through(patched_loop, monkeypatch):
+    """What was asked for: don't refuse a signal for being the third today."""
+    opened, capped, _ = _cap_run(monkeypatch, risk=5, enforce=False)
+    assert len(opened) == 4   # all four, despite risk 5 nominally allowing 2
+    assert capped == []
+
+
+def test_exposure_cap_still_binds_with_the_daily_cap_off(patched_loop, monkeypatch):
+    """Lifting one limit must not lift the others."""
+    opened, capped, broker = _cap_run(
+        monkeypatch, risk=5, enforce=False, cash=100_000
+    )
+    invested = sum(p.qty * p.avg_entry for p in broker.get_positions().values())
+    assert invested <= 70_000 + 200   # 70% exposure cap at risk 5 held
+    assert capped == []               # stopped by exposure, not the daily cap
+
+
+# ---- entries are ranked by conviction, not watchlist position ----
+
+class _PerSymbolModel:
+    """Different conviction per symbol, so ranking is observable."""
+
+    trained_through = "2024-12-31"
+
+    def __init__(self, probs):
+        self._probs = probs
+        self.symbol = None  # set by the patched feature builder
+
+    def predict_one(self, features):
+        from sentinel.model.technical import prob_to_confidence, prob_to_score
+
+        p = self._probs[self.symbol]
+        return p, prob_to_score(p), prob_to_confidence(p)
+
+
+def test_entries_go_to_the_strongest_signal_not_the_first_in_the_list(
+    patched_loop, monkeypatch
+):
+    """Watchlist order used to decide who got the exposure budget.
+
+    AAA is added first but is the weakest; DDD is last and strongest. With room
+    for only two positions, DDD and CCC must win.
+    """
+    # p -> conviction: 0.60 -> 20, 0.58 -> 16, 0.56 -> 12, 0.54 -> 8
+    probs = {"AAA": 0.54, "BBB": 0.56, "CCC": 0.58, "DDD": 0.60}
+    model = _PerSymbolModel(probs)
+
+    def features_for(session, wl, symbol, settings):
+        model.symbol = symbol  # the model reads whichever symbol is being scored
+        return _feature_frame()
+
+    monkeypatch.setattr(loop_mod, "build_symbol_features", features_for)
+    monkeypatch.setattr(
+        loop_mod, "get_latest_prices",
+        lambda s, syms: {sym: _quote(100.0) for sym in syms},
+    )
+    # 30% exposure cap at risk 1 with 5% positions: room for a handful, so cap
+    # exposure tightly instead by giving very little cash.
+    broker = SimBroker(cash=100_000)
+    broker.set_prices({s: 100.0 for s in probs})
+    report = loop_mod.run_cycle(
+        session_factory=_fake_session,
+        settings=Settings(enforce_daily_position_cap=True),
+        watchlist=_many_names(), broker=broker, model=model,
+        enforce_entry_window=False, risk_factor=5,  # 2 new/day
+    )
+    opened = [a["symbol"] for a in report.actions if a["action"] == "OPEN"]
+    assert opened == ["DDD", "CCC"], f"expected strongest first, got {opened}"
+
+
+def test_scoring_still_covers_every_ticker(patched_loop, monkeypatch):
+    """Ranking must not drop names — each still gets a logged decision."""
+    monkeypatch.setattr(
+        loop_mod, "get_latest_prices",
+        lambda s, syms: {sym: _quote(100.0) for sym in syms},
+    )
+    broker = SimBroker(cash=1_000_000)
+    broker.set_prices({s: 100.0 for s in ("AAA", "BBB", "CCC", "DDD")})
+    report = loop_mod.run_cycle(
+        session_factory=_fake_session,
+        settings=Settings(enforce_daily_position_cap=False),
+        watchlist=_many_names(), broker=broker, model=FakeModel(0.95),
+        enforce_entry_window=False, risk_factor=5,
+    )
+    assert {a["symbol"] for a in report.actions} == {"AAA", "BBB", "CCC", "DDD"}

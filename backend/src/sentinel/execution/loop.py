@@ -70,6 +70,24 @@ def _day_start_and_hwm(
     return day_start, high_water
 
 
+@dataclass
+class _Scored:
+    """One ticker's signal, computed before any of them are acted on.
+
+    Scoring is separated from acting so entries can be ranked by conviction
+    rather than by watchlist position.
+    """
+
+    symbol: str
+    has_position: bool
+    row: object
+    conv: object
+    signal: str
+    quote: "Quote | None"
+    last_price: float | None
+    common: dict
+
+
 @dataclass(frozen=True)
 class Quote:
     """A price, how old our observation of it is, and which feed served it."""
@@ -360,6 +378,13 @@ def run_cycle(
 
         sentiment = get_sentiment_cache(session, watchlist.symbols)
         new_today = 0
+
+        # Two passes. Scoring first, then acting in conviction order — because
+        # whichever candidate is handled first spends the exposure budget, and
+        # iterating the watchlist directly meant that budget went to whoever was
+        # added earliest rather than to the strongest signal. The daily-position
+        # cap used to hide this; with it lifted, ordering decides who gets in.
+        scored: list[_Scored] = []
         for t in watchlist.tickers:
             symbol = t.symbol
             has_position = symbol in positions
@@ -429,28 +454,45 @@ def run_cycle(
                 drivers=conv.drivers, features={k: _safe(row[k]) for k in FEATURE_COLUMNS},
             )
 
-            # ---- manage existing position ----
-            if has_position:
-                if signal in ("SELL", "TRIM"):
-                    res = broker.close_position(symbol)
-                    oid = res.id if res else None
-                    dlog.log_decision(
-                        session, ts=now, symbol=symbol, action="EXIT", signal=signal,
-                        reason=f"{signal} at conviction {conv.conviction:.0f}",
-                        broker_order_id=oid, **common,
-                    )
-                    report.add(symbol, "EXIT", signal)
-                    if notifier is not None:
-                        notifier.fill(symbol, f"{signal} — closed at conviction {conv.conviction:.0f}")
-                else:
-                    dlog.log_decision(
-                        session, ts=now, symbol=symbol, action="HOLD", signal=signal,
-                        reason=f"holding at conviction {conv.conviction:.0f}", **common,
-                    )
-                    report.add(symbol, "HOLD", "position held")
-                continue
+            scored.append(_Scored(
+                symbol=symbol, has_position=has_position, row=row, conv=conv,
+                signal=signal, quote=quote, last_price=last_price, common=common,
+            ))
 
-            # ---- consider a new entry ----
+        # ---- manage existing positions first ----
+        # Watchlist order is fine here, and exits run before entries so that
+        # capital freed by a close is available to a stronger new candidate in
+        # the same cycle.
+        for c in (s for s in scored if s.has_position):
+            symbol, signal, conv, common = c.symbol, c.signal, c.conv, c.common
+            if signal in ("SELL", "TRIM"):
+                res = broker.close_position(symbol)
+                oid = res.id if res else None
+                dlog.log_decision(
+                    session, ts=now, symbol=symbol, action="EXIT", signal=signal,
+                    reason=f"{signal} at conviction {conv.conviction:.0f}",
+                    broker_order_id=oid, **common,
+                )
+                report.add(symbol, "EXIT", signal)
+                invested = max(0.0, invested - positions[symbol].market_value)
+                if notifier is not None:
+                    notifier.fill(symbol, f"{signal} — closed at conviction {conv.conviction:.0f}")
+            else:
+                dlog.log_decision(
+                    session, ts=now, symbol=symbol, action="HOLD", signal=signal,
+                    reason=f"holding at conviction {conv.conviction:.0f}", **common,
+                )
+                report.add(symbol, "HOLD", "position held")
+
+        # ---- then consider entries, strongest conviction first ----
+        for c in sorted(
+            (s for s in scored if not s.has_position),
+            key=lambda s: s.conv.conviction,
+            reverse=True,
+        ):
+            symbol, signal, conv, common = c.symbol, c.signal, c.conv, c.common
+            row, quote, last_price = c.row, c.quote, c.last_price
+
             if signal != "BUY":
                 dlog.log_decision(
                     session, ts=now, symbol=symbol, action="SKIP", signal=signal,
@@ -466,7 +508,12 @@ def run_cycle(
             # session, when there was no time left to fix them. Every check below
             # is pure computation with no side effects, so running it out of hours
             # costs nothing and turns the log into a pre-flight report.
-            if new_today >= profile.max_new_positions_per_day:
+            # Optional (spec §6). With the cap off, exposure and the daily-loss
+            # breaker are the only things bounding how much goes on in one day.
+            if (
+                settings.enforce_daily_position_cap
+                and new_today >= profile.max_new_positions_per_day
+            ):
                 dlog.log_decision(
                     session, ts=now, symbol=symbol, action="SKIP", signal=signal,
                     reason=f"daily new-position cap ({profile.max_new_positions_per_day}) reached",
